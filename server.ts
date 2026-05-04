@@ -282,7 +282,7 @@ function readBody(req: http.IncomingMessage): Promise<any> {
 }
 
 function extractAPIKeys(req: http.IncomingMessage): string[] {
-  let auth = req.headers["authorization"] || (req.headers as any)["x-api-key"] || "";
+  let auth = req.headers["authorization"] || (req.headers as any)["x-api-key"] || (req.headers as any)["x-goog-api-key"] || "";
   if (Array.isArray(auth)) auth = auth[0];
   if (!auth) return [];
   if (!auth.toLowerCase().startsWith("bearer ")) auth = "Bearer " + auth;
@@ -501,6 +501,82 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       } else {
         jsonResponse(res, result);
       }
+      return;
+    }
+
+    // ===== Gemini 兼容接口 =====
+    if (p === "/v1beta/models" && req.method === "GET") {
+      jsonResponse(res, { models: SUPPORTED_MODELS });
+      return;
+    }
+
+    if (req.method === "POST" && p.match(/^\/v1beta\/models\/[^:]+:generateContent$/)) {
+      const body = await readBody(req);
+      const modelName = p.split("/").pop()?.replace(":generateContent", "") || "";
+      const contents = body.contents || [];
+      const systemInstruction = body.systemInstruction;
+      const result = await executeWithRotation((rt) =>
+        createGeminiCompletion(modelName, contents, systemInstruction, rt, false)
+      );
+      jsonResponse(res, result);
+      return;
+    }
+
+    if (req.method === "POST" && p.match(/^\/v1beta\/models\/[^:]+:streamGenerateContent$/)) {
+      const body = await readBody(req);
+      const modelName = p.split("/").pop()?.replace(":streamGenerateContent", "") || "";
+      const contents = body.contents || [];
+      const systemInstruction = body.systemInstruction;
+      const glmStream = await executeWithRotation((rt) =>
+        createGeminiCompletion(modelName, contents, systemInstruction, rt, true)
+      );
+      sseResponse(res, glmStream);
+      return;
+    }
+
+    // ===== 图像生成 =====
+    if (p === "/v1/images/generations" && req.method === "POST") {
+      const body = await readBody(req);
+      const { model, prompt, response_format } = body;
+      if (!prompt) { errorResponse(res, "Missing prompt"); return; }
+      const urls = await executeWithRotation((rt) =>
+        generateImages(model, prompt, rt)
+      );
+      const images = urls.map((url: string) =>
+        response_format === "b64_json" ? { b64_json: url } : { url }
+      );
+      jsonResponse(res, { data: images });
+      return;
+    }
+
+    // ===== 视频生成 =====
+    if (p === "/v1/videos/generations" && req.method === "POST") {
+      const body = await readBody(req);
+      const { model, prompt, video_style, emotional_atmosphere, mirror_mode, image_url, audio_id, conversation_id: convId } = body;
+      if (!prompt) { errorResponse(res, "Missing prompt"); return; }
+      const result = await executeWithRotation((rt) =>
+        generateVideos(model, prompt, rt, {
+          imageUrl: image_url || "",
+          videoStyle: video_style || "",
+          emotionalAtmosphere: emotional_atmosphere || "",
+          mirrorMode: mirror_mode || "",
+          audioId: audio_id || "",
+        }, convId)
+      );
+      jsonResponse(res, { data: result });
+      return;
+    }
+
+    // ===== Token 检查 =====
+    if (p === "/token/check" && req.method === "POST") {
+      const keys = extractAPIKeys(req);
+      const key = keys[0];
+      if (!key) { errorResponse(res, "Missing Authorization header", 401); return; }
+      // 用 key 对应的 refresh_token 检测有效性
+      const entry = tokenPool[roundRobinIdx % tokenPool.length];
+      if (!entry) { errorResponse(res, "No token available"); return; }
+      const live = await getTokenLiveStatus(entry.token);
+      jsonResponse(res, { live });
       return;
     }
 
