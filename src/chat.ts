@@ -670,16 +670,6 @@ function extractRefFileUrls(messages: any[]) {
   return urls;
 }
 
-const MAX_CONTENT_LENGTH = 60000; // GLM 输入长度限制
-
-function truncateContent(content: string, maxLength: number): string {
-  if (content.length <= maxLength) return content;
-  // 保留开头和结尾，中间截断
-  const headLen = Math.floor(maxLength * 0.3);
-  const tailLen = Math.floor(maxLength * 0.6);
-  return content.slice(0, headLen) + "\n\n... [上下文已截断，原始长度: " + content.length + " 字符] ...\n\n" + content.slice(-tailLen);
-}
-
 function messagesPrepare(messages: any[], refs: any[], isRefConv = false) {
   let content: string;
   if (isRefConv || messages.length < 2) {
@@ -709,11 +699,6 @@ function messagesPrepare(messages: any[], refs: any[], isRefConv = false) {
       return (content += `${role}\n${message.content}\n`);
     }, "") + "<|assistant|>\n").replace(/\!\[.+\]\(.+\)/g, "").replace(/\/mnt\/data\/.+/g, "");
   }
-  // 截断过长内容
-  if (content.length > MAX_CONTENT_LENGTH) {
-    console.error(`[消息截断] 原始长度: ${content.length} 字符，截断至: ${MAX_CONTENT_LENGTH} 字符`);
-  }
-  content = truncateContent(content, MAX_CONTENT_LENGTH);
   const fileRefs = refs.filter((ref) => !ref.width && !ref.height);
   const imageRefs = refs.filter((ref) => ref.width || ref.height).map((ref: any) => { ref.image_url = ref.file_url; return ref; });
   return [{

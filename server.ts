@@ -270,7 +270,7 @@ function errorResponse(res: http.ServerResponse, message: string, status = 400) 
   jsonResponse(res, { code: -1, message, data: null }, status);
 }
 
-function sseResponse(res: http.ServerResponse, stream: ReadableStream) {
+function sseResponse(res: http.ServerResponse, stream: ReadableStream | Promise<ReadableStream>) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -279,28 +279,45 @@ function sseResponse(res: http.ServerResponse, stream: ReadableStream) {
     ...corsHeaders(),
   });
 
+  // 立即发送初始注释，告诉客户端连接正常
+  res.write(": connected\n\n");
+
   // 心跳保活，防止 Claude Code 等客户端因超时断开
   const heartbeat = setInterval(() => {
     if (!res.writableEnded) res.write(": heartbeat\n\n");
   }, 15000);
 
-  const reader = stream.getReader();
-  const pump = async () => {
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!res.writableEnded) res.write(value);
+  const pumpStream = (s: ReadableStream) => {
+    const reader = s.getReader();
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!res.writableEnded) res.write(value);
+        }
+      } finally {
+        clearInterval(heartbeat);
+        if (!res.writableEnded) res.end();
       }
-    } finally {
+    };
+    pump().catch(() => {
       clearInterval(heartbeat);
       if (!res.writableEnded) res.end();
-    }
+    });
   };
-  pump().catch(() => {
-    clearInterval(heartbeat);
-    if (!res.writableEnded) res.end();
-  });
+
+  if (stream instanceof Promise) {
+    stream.then(pumpStream).catch((err) => {
+      clearInterval(heartbeat);
+      if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+        res.end();
+      }
+    });
+  } else {
+    pumpStream(stream);
+  }
 }
 
 function readBody(req: http.IncomingMessage): Promise<any> {
@@ -485,10 +502,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const { model, conversation_id: convId, messages, stream, tools } = body;
 
       if (stream) {
-        const glmStream = await executeWithRotation((rt) =>
+        // 立即发送 SSE 头，不等待 GLM 响应
+        const glmStreamPromise = executeWithRotation((rt) =>
           createCompletionStream(messages, rt, model, convId, 0, tools)
         );
-        sseResponse(res, glmStream);
+        sseResponse(res, glmStreamPromise);
       } else {
         const result = await executeWithRotation((rt) =>
           createCompletion(messages, rt, model, convId, 0, tools)
@@ -503,13 +521,20 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       if (!Array.isArray(body.messages)) { errorResponse(res, "messages must be an array"); return; }
 
       const { model, messages, system, stream, conversation_id: convId, tools } = body;
-      const result = await executeWithRotation((rt) =>
-        createClaudeCompletion(model, messages, system, rt, stream, convId, tools)
-      );
 
-      if (stream && result instanceof ReadableStream) {
-        sseResponse(res, result);
+      if (stream) {
+        // 立即发送 SSE 头，不等待 GLM 响应
+        const claudeStreamPromise = executeWithRotation((rt) =>
+          createClaudeCompletion(model, messages, system, rt, true, convId, tools)
+        ).then((result) => {
+          if (result instanceof ReadableStream) return result;
+          throw new Error("Expected stream but got non-stream response");
+        });
+        sseResponse(res, claudeStreamPromise);
       } else {
+        const result = await executeWithRotation((rt) =>
+          createClaudeCompletion(model, messages, system, rt, false, convId, tools)
+        );
         jsonResponse(res, result);
       }
       return;
@@ -538,10 +563,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const modelName = p.split("/").pop()?.replace(":streamGenerateContent", "") || "";
       const contents = body.contents || [];
       const systemInstruction = body.systemInstruction;
-      const glmStream = await executeWithRotation((rt) =>
+      const glmStreamPromise = executeWithRotation((rt) =>
         createGeminiCompletion(modelName, contents, systemInstruction, rt, true)
       );
-      sseResponse(res, glmStream);
+      sseResponse(res, glmStreamPromise);
       return;
     }
 
