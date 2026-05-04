@@ -1,0 +1,13 @@
+services:
+  glm-free-api:
+    build: .
+    container_name: glm-free-api
+    restart: always
+    ports:
+      - "38412:38412"
+    environment:
+      - ADMIN_KEY=changeme
+    volumes:
+      - glm-data:/app
+volumes:
+  glm-data:

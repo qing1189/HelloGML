@@ -8,6 +8,11 @@ export function uuid(separator = true): string {
 }
 
 export async function md5(text: string): Promise<string> {
+  // WebCrypto (CF Workers) doesn't support MD5 in Node.js, use native crypto
+  if (typeof process !== "undefined" && process.versions?.node) {
+    const nodeCrypto = await import("node:crypto");
+    return nodeCrypto.createHash("md5").update(text).digest("hex");
+  }
   const encoder = new TextEncoder();
   const data = encoder.encode(text);
   const hashBuffer = await crypto.subtle.digest("MD5", data);

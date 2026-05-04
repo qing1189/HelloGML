@@ -1,0 +1,5 @@
+node_modules/
+tokens.json
+.wrangler/
+.dev.vars
+*.log

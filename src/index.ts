@@ -5,6 +5,7 @@ import {
   generateImages,
   generateVideos,
   getTokenLiveStatus,
+  TokenExpiredError,
 } from "./chat.ts";
 import {
   createClaudeCompletion,
@@ -17,6 +18,82 @@ import {
 } from "./utils.ts";
 import { WELCOME_HTML } from "./welcome.ts";
 import { getAdminPanelHTML } from "./admin-panel.ts";
+
+function getTokenFetchHTML(origin: string): string {
+  return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Auto-Fetch Helper</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:32px;max-width:560px;width:90%}
+h1{font-size:20px;margin-bottom:16px;color:#fff}
+.step{background:#222;border-radius:8px;padding:16px;margin-bottom:12px;font-size:14px;line-height:1.6}
+.step b{color:#4fc3f7}
+.code{background:#111;border:1px solid #444;border-radius:6px;padding:12px;font-family:monospace;font-size:12px;color:#a5d6a7;word-break:break-all;white-space:pre-wrap;position:relative;cursor:pointer}
+.code:hover{border-color:#4fc3f7}
+.btn{display:inline-block;background:#4fc3f7;color:#000;border:none;padding:10px 20px;border-radius:6px;font-size:14px;cursor:pointer;font-weight:600}
+.btn:hover{background:#81d4fa}
+.btn:disabled{background:#555;color:#999;cursor:not-allowed}
+.status{margin-top:12px;padding:12px;border-radius:6px;font-size:13px;display:none}
+.status.ok{display:block;background:#1b3a1b;border:1px solid #2e7d32;color:#a5d6a7}
+.status.err{display:block;background:#3a1b1b;border:1px solid #c62828;color:#ef9a9a}
+.tip{font-size:12px;color:#888;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Token Auto-Fetch Helper</h1>
+<div class="step">
+<b>Step 1:</b> Visit <a href="https://chatglm.cn/main/alltoolsdetail" target="_blank" style="color:#4fc3f7">chatglm.cn</a> in your browser (no login needed)
+</div>
+<div class="step">
+<b>Step 2:</b> Open browser DevTools (F12) \u2192 Console, paste and run:
+<div class="code" onclick="copySnippet()" id="snippet">fetch("/token/auto-fetch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({refresh_token:document.cookie.match(/chatglm_refresh_token=([^;]+)/)?.[1]||""})}).then(r=>r.json()).then(d=>alert(d.success?"Token added! ID:"+d.id:"Error:"+d.message)).catch(e=>alert("Error:"+e))</div>
+<div class="tip">Click to copy \u2022 Or use the auto method below</div>
+</div>
+<div class="step">
+<b>Step 3 (Auto):</b> If you have the token already, paste it here:
+<div style="margin-top:8px;display:flex;gap:8px">
+<input type="text" id="tokenInput" placeholder="paste chatglm_refresh_token here" style="flex:1;background:#111;border:1px solid #444;border-radius:6px;padding:8px;color:#e0e0e0;font-size:13px">
+<button class="btn" onclick="submitToken()">Submit</button>
+</div>
+</div>
+<div class="status" id="status"></div>
+<div class="step" style="margin-top:16px">
+<b>Bookmarklet:</b> Drag this link to your bookmarks bar, then click it on chatglm.cn page:
+<div style="margin-top:8px">
+<a href="javascript:void(function(){var t=document.cookie.match(/chatglm_refresh_token=([^;]+)/);if(!t){alert('No chatglm_refresh_token cookie found');return}fetch('${origin}/token/auto-fetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:t[1]})}).then(r=>r.json()).then(function(d){alert(d.success?'Token added! ID:'+d.id:'Error:'+d.message)}).catch(function(e){alert('Error:'+e)})}())" style="color:#4fc3f7;font-size:13px">\ud83d\ude80 Auto-Fetch GLM Token</a>
+</div>
+</div>
+</div>
+<script>
+function copySnippet(){
+var el=document.getElementById('snippet');
+var text=el.textContent;
+var workerOrigin=location.origin;
+text=text.replace('/token/auto-fetch',workerOrigin+'/token/auto-fetch');
+navigator.clipboard.writeText(text).then(function(){el.style.borderColor='#4fc3f7';setTimeout(function(){el.style.borderColor='#444'},1000)})
+}
+function submitToken(){
+var t=document.getElementById('tokenInput').value.trim();
+if(!t){showStatus('Please paste a token','err');return}
+fetch('/token/auto-fetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:t})}).then(r=>r.json()).then(function(d){
+if(d.success){showStatus('Token added! ID: '+d.id,'ok')}else{showStatus('Error: '+d.message,'err')}
+}).catch(function(e){showStatus('Error: '+e,'err')})
+}
+function showStatus(msg,type){
+var el=document.getElementById('status');
+el.textContent=msg;
+el.className='status '+type
+}
+</script>
+</body>
+</html>`;
+}
 
 export interface Env {
   SIGN_SECRET?: string;
@@ -65,13 +142,25 @@ async function getTokenPool(kv: KVNamespace): Promise<{ id: string; token: strin
   return tokens;
 }
 
+async function removeExpiredToken(kv: KVNamespace, refreshToken: string): Promise<void> {
+  const list = await kv.list({ prefix: "rt:" });
+  for (const key of list.keys) {
+    const token = await kv.get(key.name);
+    if (token === refreshToken) {
+      await kv.delete(key.name);
+      console.error(`[TokenPool] 已移除过期 token: ${key.name}`);
+      return;
+    }
+  }
+}
+
 let tokenRoundRobinIndex = 0;
 
-function selectTokenFromPool(tokens: { id: string; token: string }[]): string | null {
+function selectTokenFromPool(tokens: { id: string; token: string }[]): { id: string; token: string } | null {
   if (tokens.length === 0) return null;
   const idx = tokenRoundRobinIndex % tokens.length;
   tokenRoundRobinIndex++;
-  return tokens[idx].token;
+  return tokens[idx];
 }
 
 async function authenticate(request: Request, env: Env): Promise<string> {
@@ -90,9 +179,41 @@ async function authenticate(request: Request, env: Env): Promise<string> {
   const pool = await getTokenPool(env.GLM_TOKENS);
   if (pool.length === 0) throw new Error("No refresh tokens available in pool");
 
-  const token = selectTokenFromPool(pool);
-  if (!token) throw new Error("Failed to select token from pool");
-  return token;
+  const selected = selectTokenFromPool(pool);
+  if (!selected) throw new Error("Failed to select token from pool");
+  return selected.token;
+}
+
+// 带 token 轮转的请求执行器
+async function executeWithTokenRotation<T>(
+  env: Env,
+  fn: (refreshToken: string) => Promise<T>
+): Promise<T> {
+  const pool = await getTokenPool(env.GLM_TOKENS);
+  if (pool.length === 0) throw new Error("No refresh tokens available in pool");
+
+  let lastError: Error | null = null;
+  const tried = new Set<string>();
+
+  for (let i = 0; i < pool.length; i++) {
+    const selected = selectTokenFromPool(pool);
+    if (!selected || tried.has(selected.token)) continue;
+    tried.add(selected.token);
+
+    try {
+      return await fn(selected.token);
+    } catch (err: any) {
+      lastError = err;
+      if (err instanceof TokenExpiredError) {
+        console.error(`[TokenPool] Token ${selected.id} 过期，移除并尝试下一个`);
+        await removeExpiredToken(env.GLM_TOKENS, selected.token);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastError || new Error("All tokens exhausted");
 }
 
 function jsonResponse(data: any, status = 200): Response {
@@ -120,29 +241,35 @@ function sseResponse(stream: ReadableStream): Response {
 // ==================== Handlers ====================
 
 async function handleChatCompletions(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  await authenticate(request, env);
   const body = (await request.json()) as any;
 
   if (!Array.isArray(body.messages)) throw new Error("messages must be an array");
 
   const { model, conversation_id: convId, messages, stream, tools, tool_choice } = body;
   if (stream) {
-    const glmStream = await createCompletionStream(messages, refreshToken, model, convId, 0, tools);
+    const glmStream = await executeWithTokenRotation(env, (refreshToken) =>
+      createCompletionStream(messages, refreshToken, model, convId, 0, tools)
+    );
     return sseResponse(glmStream);
   } else {
-    const result = await createCompletion(messages, refreshToken, model, convId, 0, tools);
+    const result = await executeWithTokenRotation(env, (refreshToken) =>
+      createCompletion(messages, refreshToken, model, convId, 0, tools)
+    );
     return jsonResponse(result);
   }
 }
 
 async function handleClaudeMessages(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  await authenticate(request, env);
   const body = (await request.json()) as any;
 
   if (!Array.isArray(body.messages)) throw new Error("messages must be an array");
 
   const { model, messages, system, stream, conversation_id: convId, tools } = body;
-  const result = await createClaudeCompletion(model, messages, system, refreshToken, stream, convId, tools);
+  const result = await executeWithTokenRotation(env, (refreshToken) =>
+    createClaudeCompletion(model, messages, system, refreshToken, stream, convId, tools)
+  );
   if (stream && result instanceof ReadableStream) {
     return sseResponse(result);
   }
@@ -154,24 +281,28 @@ async function handleGeminiModels(): Promise<Response> {
 }
 
 async function handleGeminiGenerateContent(request: Request, path: string, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  await authenticate(request, env);
   const body = (await request.json()) as any;
 
   const modelMatch = path.match(/^\/v1beta\/models\/(.+):generateContent$/);
   const model = modelMatch ? modelMatch[1] : "gemini-pro";
   const { contents, systemInstruction, conversation_id: convId } = body;
-  const result = await createGeminiCompletion(model, contents, systemInstruction, refreshToken, false, convId);
+  const result = await executeWithTokenRotation(env, (refreshToken) =>
+    createGeminiCompletion(model, contents, systemInstruction, refreshToken, false, convId)
+  );
   return jsonResponse(result);
 }
 
 async function handleGeminiStreamGenerateContent(request: Request, path: string, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  await authenticate(request, env);
   const body = (await request.json()) as any;
 
   const modelMatch = path.match(/^\/v1beta\/models\/(.+):streamGenerateContent$/);
   const model = modelMatch ? modelMatch[1] : "gemini-pro";
   const { contents, systemInstruction, conversation_id: convId } = body;
-  const result = await createGeminiCompletion(model, contents, systemInstruction, refreshToken, true, convId);
+  const result = await executeWithTokenRotation(env, (refreshToken) =>
+    createGeminiCompletion(model, contents, systemInstruction, refreshToken, true, convId)
+  );
   if (result instanceof ReadableStream) {
     return sseResponse(result);
   }
@@ -179,14 +310,16 @@ async function handleGeminiStreamGenerateContent(request: Request, path: string,
 }
 
 async function handleImageGenerations(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  await authenticate(request, env);
   const body = (await request.json()) as any;
 
   if (!isString(body.prompt)) throw new Error("prompt must be a string");
   const prompt = body.prompt;
   const responseFormat = defaultTo(body.response_format, "url");
   const assistantId = /^[a-z0-9]{24,}$/.test(body.model) ? body.model : undefined;
-  const imageUrls = await generateImages(assistantId, prompt, refreshToken);
+  const imageUrls = await executeWithTokenRotation(env, (refreshToken) =>
+    generateImages(assistantId, prompt, refreshToken)
+  );
 
   let data: any[];
   if (responseFormat == "b64_json") {
@@ -209,7 +342,7 @@ async function fetchBase64(url: string): Promise<string> {
 }
 
 async function handleVideoGenerations(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  await authenticate(request, env);
   const body = (await request.json()) as any;
 
   if (!isString(body.prompt)) throw new Error("prompt must be a string");
@@ -231,13 +364,15 @@ async function handleVideoGenerations(request: Request, env: Env): Promise<Respo
   if (emotionalAtmosphere && !validEmotions.includes(emotionalAtmosphere)) throw new Error(`emotional_atmosphere must be one of ${validEmotions.join("/")}`);
   if (mirrorMode && !validMirrors.includes(mirrorMode)) throw new Error(`mirror_mode must be one of ${validMirrors.join("/")}`);
 
-  const data = await generateVideos(model, prompt, refreshToken, {
-    imageUrl: imageUrl || "",
-    videoStyle,
-    emotionalAtmosphere,
-    mirrorMode,
-    audioId: audioId || "",
-  }, convId);
+  const data = await executeWithTokenRotation(env, (refreshToken) =>
+    generateVideos(model, prompt, refreshToken, {
+      imageUrl: imageUrl || "",
+      videoStyle,
+      emotionalAtmosphere,
+      mirrorMode,
+      audioId: audioId || "",
+    }, convId)
+  );
   return jsonResponse({ created: unixTimestamp(), data });
 }
 
@@ -249,6 +384,22 @@ async function handleTokenCheck(request: Request, env: Env): Promise<Response> {
   const refreshToken = await authenticate(request, env);
   const live = await getTokenLiveStatus(refreshToken);
   return jsonResponse({ live });
+}
+
+// 从浏览器 cookie 自动提取 refresh_token 并存入 KV
+async function handleAutoFetchToken(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as any;
+  const refreshToken = body.refresh_token;
+  if (!refreshToken) return errorResponse("Missing refresh_token", 400);
+
+  // 验证 token 是否有效
+  const live = await getTokenLiveStatus(refreshToken);
+  if (!live) return errorResponse("Token is not valid", 400);
+
+  // 存入 KV
+  const id = `auto_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  await env.GLM_TOKENS.put(`rt:${id}`, refreshToken);
+  return jsonResponse({ success: true, message: "Token added to pool", id, live });
 }
 
 // ==================== Admin Handlers ====================
@@ -378,6 +529,13 @@ export default {
         response = new Response("pong", { headers: corsHeaders() });
       } else if (path === "/token/check" && request.method === "POST") {
         response = await handleTokenCheck(request, env);
+      } else if (path === "/token/auto-fetch" && request.method === "POST") {
+        response = await handleAutoFetchToken(request, env);
+      } else if (path === "/token/fetch-helper" && request.method === "GET") {
+        const origin = url.origin;
+        response = new Response(getTokenFetchHTML(origin), {
+          headers: { "Content-Type": "text/html", ...corsHeaders() },
+        });
       } else if (path === "/admin/apikey") {
         response = await handleAdminAPIKey(request, env);
       } else if (path === "/admin/token") {

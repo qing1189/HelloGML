@@ -13,4 +13,4 @@ ADMIN_KEY = "changeme"
 # 然后将输出的 id 填入下方
 [[kv_namespaces]]
 binding = "GLM_TOKENS"
-id = ""  # <-- 替换为你创建 KV 后得到的 id
+id = "placeholder"  # <-- 替换为你创建 KV 后得到的 id

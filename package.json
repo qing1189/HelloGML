@@ -1,14 +1,19 @@
 {
-  "name": "glm-free-api-worker",
-  "version": "1.0.0",
+  "name": "glm-free-api",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "start": "wrangler dev"
+    "start": "tsx server.ts",
+    "server": "tsx server.ts"
+  },
+  "dependencies": {
+    "puppeteer-core": "^22.0.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240512.0",
+    "tsx": "^4.0.0",
     "typescript": "^5.4.5",
     "wrangler": "^3.57.0"
   }

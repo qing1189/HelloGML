@@ -317,6 +317,13 @@ async function removeConversation(convId: string, refreshToken: string, assistan
   finally { clearTimeout(timeoutId); }
 }
 
+export class TokenExpiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TokenExpiredError";
+  }
+}
+
 async function checkResult(response: Response, refreshToken: string): Promise<any> {
   const data: any = await response.json().catch(() => null);
   if (!data) return null;
@@ -324,8 +331,8 @@ async function checkResult(response: Response, refreshToken: string): Promise<an
   if (!isFiniteNumber(code) && !isFiniteNumber(status)) return data;
   if (code === 0 || status === 0) return data;
   if (code == 401) await deleteCachedAccessToken(refreshToken);
-  if (message?.includes('40102')) {
-    throw new Error(`[请求glm失败]: 您的refresh_token已过期，请重新登录获取`);
+  if (message?.includes('40102') || code === 40102) {
+    throw new TokenExpiredError(`refresh_token已过期`);
   }
   throw new Error(`[请求glm失败]: ${message}`);
 }
@@ -391,14 +398,18 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
     );
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("text/event-stream")) {
-      const errText = await response.text();
+      const errText = await response.text().catch(() => "");
       console.error(errText);
-      throw new Error(`Stream response Content-Type invalid: ${contentType}`);
+      if (errText.includes("40102") || errText.includes("refresh_token")) {
+        throw new TokenExpiredError("refresh_token已过期");
+      }
+      throw new Error(`上游返回非SSE响应: ${contentType} ${errText.slice(0, 200)}`);
     }
     const answer = await receiveStream(model, response.body!, tools);
     removeConversation(answer.id, refreshToken, assistantId).catch(() => {});
     return answer;
   })().catch(async (err) => {
+    if (err instanceof TokenExpiredError) throw err;
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);
@@ -455,25 +466,20 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
     );
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("text/event-stream")) {
-      const errText = await response.text();
+      const errText = await response.text().catch(() => "");
       console.error("Invalid response Content-Type:", contentType, errText);
-      const encoder = new TextEncoder();
-      return new ReadableStream({
-        start(controller) {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-            id: "", model: MODEL_NAME, object: "chat.completion.chunk",
-            choices: [{ index: 0, delta: { role: "assistant", content: "服务暂时不可用，第三方响应错误" }, finish_reason: "stop" }],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-            created: unixTimestamp(),
-          })}\n\n`));
-          controller.close();
-        }
-      });
+      // 检测 token 过期
+      if (errText.includes("40102") || errText.includes("refresh_token")) {
+        throw new TokenExpiredError("refresh_token已过期");
+      }
+      throw new Error(`上游返回非SSE响应: ${contentType} ${errText.slice(0, 200)}`);
     }
     return createTransStream(model, response.body!, (convId: string) => {
       removeConversation(convId, refreshToken, assistantId).catch(() => {});
     }, tools);
   })().catch(async (err) => {
+    // token 过期不重试，直接向上抛出由 token 轮转逻辑处理
+    if (err instanceof TokenExpiredError) throw err;
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);

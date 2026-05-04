@@ -1,108 +1,132 @@
-# GLM-Free-API for Cloudflare Workers
-About
+# GLM-Free-API
 
-智谱清言网页版的 Cloudflare Worker 2API层，提供 OpenAI / Claude / Gemini 三种协议兼容接口，支持流式对话、Tools调用、AI 绘图、视频生成与多账号 Token 轮询。
+将智谱清言（chatglm.cn）网页端私有 API 转换为标准大模型服务接口，支持 OpenAI / Claude / Gemini 三种协议，可对接 claude-code、open-code、NextChat 等任何兼容客户端。
 
 ---
 
 ## 目录
 
-- [项目概述](#项目概述)
 - [核心特性](#核心特性)
-- [架构设计](#架构设计)
-- [快速开始](#快速开始)
-- [部署指南](#部署指南)
+- [VPS 部署](#vps-部署)
+- [Cloudflare Workers 部署](#cloudflare-workers-部署)
 - [Token 管理](#token-管理)
-- [API 使用指南](#api-使用指南)
+- [API 参考](#api-参考)
 - [客户端接入](#客户端接入)
-- [高级功能](#高级功能)
-- [常见问题](#常见问题)
-
----
-
-## 项目概述
-
-本项目将智谱清言（chatglm.cn）网页端的私有流式 API 转换为标准的大语言模型服务接口，使任何支持 OpenAI、Claude 或 Gemini 协议的客户端都能直接调用 GLM 系列模型的能力。
-
-
+- [实现原理](#实现原理)
 
 ---
 
 ## 核心特性
 
-| 特性                | 说明                                                         |
-| ------------------- | ------------------------------------------------------------ |
-| **多协议兼容**      | 同时支持 OpenAI (`/v1/chat/completions`)、Claude (`/v1/messages`)、Gemini (`/v1beta/models/...`) 三种请求格式 |
-| **流式响应**        | 完整的 SSE 流式输出，支持逐字显示与 reasoning_content（思考过程） |
-| **动态 Token 管理** | 认证与资源分离：API Key 仅用于身份验证，所有 `refresh_token` 组成统一池子按轮询策略调度 |
-| **多账号轮询**      | 支持在 Authorization Header 中以逗号分隔传入多个 api_key，自动选择可用账号 |
-| **AI 绘图**         | 对接智谱清言绘图智能体，支持文生图与多轮图生图               |
-| **视频生成**        | 支持文生视频、图生视频及风格参数控制                         |
-| **工具调用**        | 完整支持 Function Calling，兼容 OpenAI / Claude 格式，适配 claude-code、open-code 等 IDE |
-| **联网搜索**        | 模型自动触发联网搜索，搜索结果通过 `reasoning_content` 字段返回 |
-| **长文档/图像解析** | 支持 BASE64 图像上传与长文本上下文                           |
+- **三协议兼容** — OpenAI `/v1/chat/completions`、Claude `/v1/messages`、Gemini `/v1beta/models/...`
+- **流式输出** — 完整 SSE 流式对话，支持 `reasoning_content`（思考过程/联网搜索）
+- **工具调用** — Function Calling，兼容 OpenAI `tool_calls` 和 Claude `tool_use` 格式，适配 claude-code / open-code
+- **AI 绘图 / 视频生成** — 文生图、文生视频、图生视频
+- **Token 池轮转** — 多 `refresh_token` 组成池子，轮询调度 + 过期自动移除 + 自动切换
+- **双部署模式** — VPS（Node.js + Puppeteer 全自动）或 Cloudflare Workers（免费，无需服务器）
 
 ---
 
-## 架构设计
+## 架构
 
 ```
-┌─────────────────┐     ┌──────────────────────────┐     ┌─────────────────┐
-│   客户端应用     │────▶│  Cloudflare Worker (V8)  │────▶│  chatglm.cn     │
-│ (NextChat/Lobe) │     │                          │     │  私有 API       │
-└─────────────────┘     │  • KV: api_key 映射      │     └─────────────────┘
-                        │  • Cache: access_token   │
-                        │  • 签名算法              │
-                        │  • 协议适配层            │
-                        └──────────────────────────┘
+┌──────────────┐     ┌───────────────────────┐     ┌─────────────┐
+│  claude-code │     │  VPS (Node.js)        │     │             │
+│  NextChat    │────▶│  或 CF Workers (V8)   │────▶│  chatglm.cn │
+│  LobeChat    │     │                       │     │  私有 API   │
+└──────────────┘     │  • Token 池轮转       │     └─────────────┘
+                     │  • 协议适配层         │
+                     │  • 签名算法           │
+                     │  • SSE 流式转换       │
+                     └───────────────────────┘
 ```
 
-**请求处理流程**
-
-1. 客户端以 `Authorization: Bearer <api_key>` 发起请求
-2. Worker 验证该 `api_key` 是否有效（检查 `ak:*` 记录）
-3. 从 Token 池（所有 `rt:*` 记录）中按轮询策略选择一个 `refresh_token`
-4. 若 `access_token` 未缓存或已过期，使用选中的 `refresh_token` 向智谱换取新的 `access_token`
-5. 构造带签名的请求头，调用智谱流式接口
-6. 将智谱 SSE 流实时转换为目标协议格式并返回给客户端
+请求流程：客户端发请求 → 服务端从 Token 池轮询选一个 `refresh_token` → 换取 `access_token` → 构造签名调用智谱流式接口 → 实时转换为对应协议格式返回。若 Token 过期，自动移除并尝试下一个。
 
 ---
 
-## 快速开始
+## VPS 部署
 
-### 前置要求
-
-- [Node.js](https://nodejs.org/) 18+
-- [Cloudflare 账号](https://dash.cloudflare.com/sign-up)（免费版即可）
-- 智谱清言账号及 `chatglm_refresh_token`
-
-### 获取 refresh_token
-
-登录 [chatglm.cn](https://chatglm.cn) 后，打开浏览器开发者工具 → Application → Cookies，复制 `chatglm_refresh_token` 的值。
-
-### 安装与本地开发
+### Docker 一键部署（推荐）
 
 ```bash
-cd cf-worker
-npm install
-
-# 本地开发（自动模拟 KV 和 Cache）
-npx wrangler dev --local
+docker run -d \
+  --name glm-free-api \
+  --restart always \
+  -p 38412:38412 \
+  -e ADMIN_KEY=your-strong-password \
+  -v glm-data:/app \
+  glm-free-api
 ```
 
-本地服务默认运行在 `http://localhost:8787`。
+或者用 docker-compose：
+
+```bash
+docker compose up -d
+```
+
+服务启动后：
+1. 自动检测容器内 `tokens.json` 是否有可用 Token
+2. 若为空，自动通过 Chromium 访问 chatglm.cn 获取 `chatglm_refresh_token`
+3. 每 30 分钟自动刷新 Token 池
+4. 访问 `http://your-server:38412/token/fetch-helper` 管理页面添加/查看 Token
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PORT` | `38412` | 监听端口 |
+| `CHROME_PATH` | `/usr/bin/chromium` | Chrome 路径（容器内已内置） |
+| `SIGN_SECRET` | `8a1317a7468aa3ad86e997d08f3f31cb` | 签名密钥 |
+| `ADMIN_KEY` | `changeme` | 管理接口密钥，**生产环境务必修改** |
+
+### 裸机部署
+
+不需要 Docker 时也可以直接运行：
+
+```bash
+cd HelloGML
+npm install
+npm run server
+```
+
+需自行安装 Node.js 18+ 和 Chrome。后台运行用 systemd：
+
+```ini
+# /etc/systemd/system/glm-free-api.service
+[Unit]
+Description=GLM Free API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/HelloGML
+ExecStart=/usr/bin/npx tsx server.ts
+Restart=always
+RestartSec=5
+Environment=PORT=38412
+Environment=ADMIN_KEY=your-strong-password
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable glm-free-api
+sudo systemctl start glm-free-api
+```
 
 ---
 
-## 部署指南
+## Cloudflare Workers 部署
 
-### 第一步：创建 KV Namespace
+### 创建 KV Namespace
 
 ```bash
 npx wrangler kv:namespace create GLM_TOKENS
 ```
 
-命令会输出如下内容，将 `id` 填入 `wrangler.toml`：
+将输出的 `id` 填入 `wrangler.toml`：
 
 ```toml
 [[kv_namespaces]]
@@ -110,401 +134,337 @@ binding = "GLM_TOKENS"
 id = "<你的-namespace-id>"
 ```
 
-### 第二步：配置环境变量
+### 配置
 
-编辑 [`wrangler.toml`](wrangler.toml)：
+编辑 `wrangler.toml`：
 
 ```toml
 [vars]
-# 智谱请求签名密钥（保持默认值即可，或自定义）
 SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
-
-# 管理接口保护密钥，部署前务必修改为随机强密码
-ADMIN_KEY = "your-random-strong-password"
+ADMIN_KEY = "your-random-strong-password"  # 生产环境务必修改
 ```
 
-> **安全提示**：`ADMIN_KEY` 用于保护 `/admin/token` 接口。若留空或未设置，任何人都能修改 Token 映射，生产环境务必设置强密码。
-
-### 第三步：部署
+### 部署
 
 ```bash
 npx wrangler deploy
 ```
 
-部署成功后，终端会输出 Worker 的访问地址。由于 `.workers.dev` 域名在中国大陆可能被拦截，建议绑定自定义域名以获得最佳访问体验。
+部署后输出 Worker 访问地址。`.workers.dev` 域名在中国大陆可能被拦截，建议绑定自定义域名。
+
+### 本地开发
+
+```bash
+npx wrangler dev --local
+```
+
+本地运行在 `http://localhost:8787`。
 
 ---
 
 ## Token 管理
 
-本项目采用**认证与资源分离**的架构：
+### 什么是 Token
 
-- **API Key**：仅用于身份认证，证明调用方有权使用服务。可配置多个，效果等价。
-- **Token 池**：所有智谱 `refresh_token` 组成一个共享池，系统按**轮询（Round Robin）**策略自动调度。
+`chatglm_refresh_token` 是智谱清言的认证凭证。本项目将多个 Token 组成池子，按轮询策略自动调度，过期自动移除。请求时传入的 `api_key` 仅用于身份认证（证明调用方有权使用），与 Token 池完全分离。
 
-这种设计让你可以为不同客户端分配不同的 API Key，但它们背后共享同一组智谱账号资源，实现真正的统一系统调控。
+### 获取 Token
 
----
+**方式一：浏览器手动获取**
 
-### API Key 管理
+1. 打开 [chatglm.cn](https://chatglm.cn)
+2. F12 → Application → Cookies
+3. 复制 `chatglm_refresh_token` 的值
 
-#### 添加 API Key
+**方式二：VPS 自动获取**
+
+安装 Chrome 后，服务启动时自动通过 Puppeteer 获取。也可在管理页面点击「自动获取」按钮。
+
+**方式三：浏览器控制台一键提交**
+
+在 chatglm.cn 页面 F12 控制台运行（地址替换为你的服务地址）：
+
+```javascript
+fetch("http://your-server:38412/token/auto-fetch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({refresh_token:document.cookie.match(/chatglm_refresh_token=([^;]+)/)?.[1]||""})}).then(r=>r.json()).then(d=>alert(d.success?"添加成功":"失败: "+d.message))
+```
+
+### 管理页面
+
+访问 `http://your-server:38412/token/fetch-helper` 可视化管理 Token，支持自动获取、手动添加、删除。
+
+### API 接口
+
+#### 添加 Token
 
 ```bash
-curl -X POST https://<your-worker-domain>/admin/apikey \
+curl -X POST http://your-server:38412/token/auto-fetch \
   -H "Content-Type: application/json" \
-  -H "X-Admin-Key: <your-admin-key>" \
-  -d '{ "api_key": "sk-my-personal-key" }'
-```
-
-响应：
-
-```json
-{ "success": true, "message": "API key added successfully" }
-```
-
-#### 查看已配置的 API Key
-
-```bash
-curl -X GET https://<your-worker-domain>/admin/apikey \
-  -H "X-Admin-Key: <your-admin-key>"
-```
-
-响应：
-
-```json
-{
-  "keys": [
-    { "api_key": "sk-my-personal-key" },
-    { "api_key": "sk-team-shared-key" }
-  ]
-}
-```
-
-#### 删除 API Key
-
-```bash
-curl -X DELETE https://<your-worker-domain>/admin/apikey \
-  -H "Content-Type: application/json" \
-  -H "X-Admin-Key: <your-admin-key>" \
-  -d '{ "api_key": "sk-my-personal-key" }'
-```
-
----
-
-### Token 池管理
-
-#### 添加 Refresh Token 到池子
-
-```bash
-curl -X POST https://<your-worker-domain>/admin/token \
-  -H "Content-Type: application/json" \
-  -H "X-Admin-Key: <your-admin-key>" \
-  -d '{ "refresh_token": "eyJhbGciOiJIUzI1NiIs..." }'
-```
-
-响应：
-
-```json
-{ "success": true, "message": "Token added to pool", "id": "tk_1234567890_abc123" }
+  -d '{"refresh_token":"eyJhbG..."}'
 ```
 
 #### 查看 Token 池
 
 ```bash
-curl -X GET https://<your-worker-domain>/admin/token \
-  -H "X-Admin-Key: <your-admin-key>"
+curl http://your-server:38412/token/list
 ```
 
-响应：
-
-```json
-{
-  "tokens": [
-    { "id": "tk_1234567890_abc123", "token_preview": "eyJhbG...****...xyz" },
-    { "id": "tk_1234567891_def456", "token_preview": "eyJhbG...****...abc" }
-  ]
-}
-```
-
-#### 从池子删除 Token
+#### 删除 Token
 
 ```bash
-curl -X DELETE https://<your-worker-domain>/admin/token \
+curl -X POST http://your-server:38412/token/delete \
   -H "Content-Type: application/json" \
-  -H "X-Admin-Key: <your-admin-key>" \
-  -d '{ "id": "tk_1234567890_abc123" }'
+  -d '{"id":"tk_xxx"}'
 ```
 
----
-
-### 多 Token 轮询
-
-系统会自动从 Token 池中按轮询策略选择可用账号。如需更高可用性，可在池子中添加多个 `refresh_token`。当某个 Token 失效时，只需在管理面板中更新池子即可，**无需修改任何客户端配置**。
-
-同时，单次请求仍支持在 Authorization Header 中以逗号分隔传入多个 api_key（容错用途）：
+#### 立即自动获取
 
 ```bash
-curl -X POST https://<your-worker-domain>/v1/chat/completions \
-  -H "Authorization: Bearer key-a,key-b,key-c" \
-  ...
+curl -X POST http://your-server:38412/token/auto-fetch-now
 ```
 
-Worker 会依次尝试每个 key，使用第一个通过认证的账号发起请求。
+### Token 轮转机制
+
+- 系统按轮询（Round Robin）策略从池中选择 Token
+- Token 过期（上游返回 40102）时自动从池中移除，切换下一个
+- Token 连续失败 3 次会被暂时跳过
+- 池中 Token 全部耗尽时返回错误，需补充新 Token
 
 ---
 
-## API 使用指南
+## API 参考
+
+所有接口均需认证，通过 `Authorization: Bearer <api_key>` 传入任意非空字符串即可。
+
+### 支持的模型
+
+当前支持：`glm5`
+
+```bash
+curl http://your-server:38412/v1/models -H "Authorization: Bearer any-key"
+```
 
 ### OpenAI 兼容接口
 
-#### 非流式对话
+#### 对话
 
-```bash
-curl -X POST https://<your-worker-domain>/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <your-api-key>" \
-  -d '{
-    "model": "glm-4.7",
-    "messages": [
-      { "role": "system", "content": "你是一个乐于助人的助手" },
-      { "role": "user", "content": "请用一句话解释量子计算" }
-    ],
-    "stream": false
-  }'
+```
+POST /v1/chat/completions
 ```
 
-#### 流式对话
-
 ```bash
-curl -X POST https://<your-worker-domain>/v1/chat/completions \
+curl -X POST http://your-server:38412/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "Authorization: Bearer any-key" \
   -d '{
-    "model": "glm-4.7",
-    "messages": [{ "role": "user", "content": "写一首关于春天的短诗" }],
+    "model": "glm5",
+    "messages": [
+      { "role": "system", "content": "你是一个助手" },
+      { "role": "user", "content": "你好" }
+    ],
     "stream": true
   }'
 ```
 
-#### 携带上下文的多轮对话
+参数说明：
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `model` | string | 模型名，如 `glm5` |
+| `messages` | array | 消息列表，支持 `system`/`user`/`assistant`/`tool` |
+| `stream` | boolean | 是否流式，默认 false |
+| `tools` | array | OpenAI 格式工具定义 |
+| `conversation_id` | string | 多轮对话的会话 ID（可选） |
+
+#### 工具调用
 
 ```bash
-curl -X POST https://<your-worker-domain>/v1/chat/completions \
+curl -X POST http://your-server:38412/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "Authorization: Bearer any-key" \
   -d '{
-    "model": "glm-4.7",
-    "conversation_id": "conv_abc123",
-    "messages": [
-      { "role": "user", "content": "我叫张三" },
-      { "role": "assistant", "content": "你好张三，很高兴认识你。" },
-      { "role": "user", "content": "我叫什么名字？" }
-    ]
-  }'
-```
-
-#### 工具调用（Function Calling）
-
-支持 OpenAI 标准 `tools` / `tool_choice` 参数，可对接 claude-code、open-code、Dify Agent 等依赖工具调用的客户端。
-
-**发起工具调用请求**
-
-```bash
-curl -X POST https://<your-worker-domain>/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <your-api-key>" \
-  -d '{
-    "model": "glm-4.7",
-    "messages": [{ "role": "user", "content": "北京今天天气怎么样？" }],
-    "tools": [
-      {
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "description": "获取指定城市的当前天气",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "city": { "type": "string", "description": "城市名称" }
-            },
-            "required": ["city"]
-          }
+    "model": "glm5",
+    "messages": [{"role":"user","content":"北京天气如何？"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "获取城市天气",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
         }
       }
-    ]
+    }]
   }'
 ```
 
-响应示例（模型决定调用工具时）：
+返回：
 
 ```json
 {
   "choices": [{
     "message": {
       "role": "assistant",
-      "content": null,
       "tool_calls": [{
         "id": "call_xxx",
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "arguments": "{\"city\":\"北京\"}"
-        }
+        "function": {"name": "get_weather", "arguments": "{\"city\":\"北京\"}"}
       }]
-    }
+    },
+    "finish_reason": "tool_calls"
   }]
 }
 ```
 
-**多轮对话中的工具结果反馈**
+多轮工具反馈：
 
-```bash
-curl -X POST https://<your-worker-domain>/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <your-api-key>" \
-  -d '{
-    "model": "glm-4.7",
-    "messages": [
-      { "role": "user", "content": "北京今天天气怎么样？" },
-      { "role": "assistant", "tool_calls": [{ "id": "call_xxx", "type": "function", "function": { "name": "get_weather", "arguments": "{\"city\":\"北京\"}" } }] },
-      { "role": "tool", "tool_call_id": "call_xxx", "content": "晴朗，25°C，微风" },
-      { "role": "user", "content": "上海呢？" }
-    ],
-    "tools": [...]
-  }'
+```json
+{"role": "assistant", "tool_calls": [{"id":"call_xxx","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]},
+{"role": "tool", "tool_call_id": "call_xxx", "content": "晴朗，25°C"},
+{"role": "user", "content": "上海呢？"}
 ```
-
-> **注意**：流式输出同样支持工具调用。在流式模式下，工具调用 JSON 会被智能缓冲，不会以普通文本形式泄露到 `content` 字段中。
 
 ### Claude 兼容接口
 
+```
+POST /v1/messages
+```
+
 ```bash
-curl -X POST https://<your-worker-domain>/v1/messages \
+curl -X POST http://your-server:38412/v1/messages \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: <your-api-key>" \
+  -H "X-API-Key: any-key" \
   -d '{
-    "model": "glm-4.7",
-    "messages": [{ "role": "user", "content": "你好" }],
+    "model": "glm5",
+    "messages": [{"role":"user","content":"你好"}],
     "stream": true,
     "max_tokens": 4096
   }'
 ```
 
-#### Claude 格式的工具调用
-
-Claude 的 `tools` / `tool_choice` 参数会自动转换为 OpenAI 格式后处理，返回时也会转换回 Claude 的 `tool_use` / `tool_result` 格式：
+Claude 格式的工具调用：
 
 ```bash
-curl -X POST https://<your-worker-domain>/v1/messages \
+curl -X POST http://your-server:38412/v1/messages \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: <your-api-key>" \
+  -H "X-API-Key: any-key" \
   -d '{
-    "model": "glm-4.7",
-    "messages": [{ "role": "user", "content": "查一下北京的天气" }],
-    "tools": [
-      {
-        "name": "get_weather",
-        "description": "获取指定城市的当前天气",
-        "input_schema": {
-          "type": "object",
-          "properties": {
-            "city": { "type": "string" }
-          },
-          "required": ["city"]
-        }
+    "model": "glm5",
+    "messages": [{"role":"user","content":"查北京天气"}],
+    "tools": [{
+      "name": "get_weather",
+      "description": "获取城市天气",
+      "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
       }
-    ],
+    }],
     "stream": false
   }'
 ```
 
+返回：
+
+```json
+{
+  "type": "message",
+  "content": [{
+    "type": "tool_use",
+    "id": "call_xxx",
+    "name": "get_weather",
+    "input": {"city": "北京"}
+  }],
+  "stop_reason": "tool_use"
+}
+```
+
+多轮工具反馈（Claude 格式）：
+
+```json
+{"role": "assistant", "content": [{"type":"tool_use","id":"call_xxx","name":"get_weather","input":{"city":"北京"}}]},
+{"role": "user", "content": [{"type":"tool_result","tool_use_id":"call_xxx","content":"晴朗，25°C"}]},
+{"role": "user", "content": "上海呢？"}
+```
+
 ### Gemini 兼容接口
 
+```
+POST /v1beta/models/:model:streamGenerateContent
+```
+
 ```bash
-curl -X POST "https://<your-worker-domain>/v1beta/models/gemini-1.5-pro:streamGenerateContent" \
+curl -X POST "http://your-server:38412/v1beta/models/glm5:streamGenerateContent" \
   -H "Content-Type: application/json" \
-  -H "x-goog-api-key: <your-api-key>" \
-  -d '{
-    "contents": [{ "role": "user", "parts": [{ "text": "你好" }] }]
-  }'
+  -H "x-goog-api-key: any-key" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'
 ```
 
 ### 图像生成
 
-```bash
-curl -X POST https://<your-worker-domain>/v1/images/generations \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <your-api-key>" \
-  -d '{
-    "prompt": "一只穿着宇航服的猫咪在月球上散步",
-    "model": "glm-4.7",
-    "response_format": "url"
-  }'
+```
+POST /v1/images/generations
 ```
 
-| 参数              | 类型   | 必填 | 说明                                                   |
-| ----------------- | ------ | ---- | ------------------------------------------------------ |
-| `prompt`          | string | 是   | 图像描述                                               |
-| `model`           | string | 否   | 智能体 ID（24 位以上字母数字），留空使用默认绘图智能体 |
-| `response_format` | string | 否   | `url` 或 `b64_json`，默认 `url`                        |
+```bash
+curl -X POST http://your-server:38412/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer any-key" \
+  -d '{"prompt":"一只穿宇航服的猫在月球散步","model":"glm5","response_format":"url"}'
+```
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `prompt` | string | 图像描述 |
+| `model` | string | 智能体 ID，留空用默认绘图智能体 |
+| `response_format` | string | `url` 或 `b64_json` |
 
 ### 视频生成
 
+```
+POST /v1/videos/generations
+```
+
 ```bash
-curl -X POST https://<your-worker-domain>/v1/videos/generations \
+curl -X POST http://your-server:38412/v1/videos/generations \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <your-api-key>" \
-  -d '{
-    "model": "glm-4.7",
-    "prompt": "一只金毛犬在海边奔跑",
-    "video_style": "电影感",
-    "emotional_atmosphere": "温馨和谐",
-    "mirror_mode": "推近"
-  }'
+  -H "Authorization: Bearer any-key" \
+  -d '{"model":"glm5","prompt":"金毛犬在海边奔跑","video_style":"电影感"}'
 ```
 
-| 参数                   | 类型   | 必填 | 可选值                                            |
-| ---------------------- | ------ | ---- | ------------------------------------------------- |
-| `video_style`          | string | 否   | `卡通3D` / `黑白老照片` / `油画` / `电影感`       |
-| `emotional_atmosphere` | string | 否   | `温馨和谐` / `生动活泼` / `紧张刺激` / `凄凉寂寞` |
-| `mirror_mode`          | string | 否   | `水平` / `垂直` / `推近` / `拉远`                 |
-| `image_url`            | string | 否   | 图生视频时的参考图片 URL                          |
-| `audio_id`             | string | 否   | 指定音频 ID                                       |
-
-### Token 状态检查
-
-```bash
-curl -X POST https://<your-worker-domain>/token/check \
-  -H "Authorization: Bearer <your-api-key>"
-```
-
-响应：
-
-```json
-{ "live": true }
-```
+| 参数 | 可选值 |
+|------|--------|
+| `video_style` | `卡通3D` / `黑白老照片` / `油画` / `电影感` |
+| `emotional_atmosphere` | `温馨和谐` / `生动活泼` / `紧张刺激` / `凄凉寂寞` |
+| `mirror_mode` | `水平` / `垂直` / `推近` / `拉远` |
+| `image_url` | 图生视频参考图片 URL |
 
 ---
 
 ## 客户端接入
+
+### claude-code
+
+```bash
+# 设置 API Base URL 指向你的服务
+export ANTHROPIC_BASE_URL=http://your-server:38412
+export ANTHROPIC_API_KEY=any-key
+claude
+```
+
+> claude-code 会以 Claude 协议（`/v1/messages`）通信，自动使用 `tool_use` 格式。
 
 ### OpenAI SDK (Python)
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(
-    api_key="your-api-key",
-    base_url="https://<your-worker-domain>/v1"
-)
-
+client = OpenAI(api_key="any-key", base_url="http://your-server:38412/v1")
 response = client.chat.completions.create(
-    model="glm-4.7",
+    model="glm5",
     messages=[{"role": "user", "content": "你好"}],
-    stream=True
+    stream=True,
 )
-
 for chunk in response:
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="")
@@ -514,115 +474,69 @@ for chunk in response:
 
 ```javascript
 import OpenAI from "openai";
-
-const client = new OpenAI({
-  apiKey: "your-api-key",
-  baseUrl: "https://<your-worker-domain>/v1",
-});
-
+const client = new OpenAI({ apiKey: "any-key", baseURL: "http://your-server:38412/v1" });
 const stream = await client.chat.completions.create({
-  model: "glm-4.7",
-  messages: [{ role: "user", content: "你好" }],
-  stream: true,
+  model: "glm5", messages: [{ role: "user", content: "你好" }], stream: true,
 });
-
 for await (const chunk of stream) {
   process.stdout.write(chunk.choices[0]?.delta?.content || "");
 }
 ```
 
-### claude-code
-
-```bash
-claude config set apiKey your-api-key
-export CLAUDE_API_BASE_URL=https://<your-worker-domain>
-claude
-```
-
 ### gemini-cli
 
 ```bash
-export GEMINI_API_KEY=your-api-key
-export GEMINI_BASE_URL=https://<your-worker-domain>/v1beta
-gemini -m glm-4.7
+export GEMINI_API_KEY=any-key
+export GEMINI_BASE_URL=http://your-server:38412/v1beta
+gemini -m glm5
 ```
 
-### 第三方聊天客户端
+### 聊天客户端
 
-| 客户端                          | 配置方式                                                     |
-| ------------------------------- | ------------------------------------------------------------ |
-| **NextChat (ChatGPT-Next-Web)** | 接口地址填 `https://<your-worker-domain>/v1`，API Key 填你的自定义 api_key |
-| **LobeChat**                    | 添加自定义服务商，OpenAI 兼容模式，Base URL 同上             |
-| **Dify**                        | 模型供应商选择 OpenAI API Compatible，填入 base_url 和 api_key |
+| 客户端 | 配置 |
+|--------|------|
+| NextChat | 接口地址填 `http://your-server:38412/v1`，API Key 随意填 |
+| LobeChat | 添加自定义服务商，OpenAI 兼容模式，Base URL 同上 |
+| Dify | 模型供应商选 OpenAI API Compatible，填入 base_url |
 
 ---
 
-## 高级功能
+## 实现原理
 
-### 自定义域名绑定
+### Token 轮转
 
-`.workers.dev` 域名在中国大陆访问可能被重置，建议绑定自定义域名：
+`refresh_token` 池 + Round Robin 轮询。当上游返回 `40102` 时，`TokenExpiredError` 被抛出，服务端自动：
+1. 从池中移除过期 Token
+2. 选择下一个 Token 重试
+3. 所有 Token 耗尽时返回错误
 
-1. 在 Cloudflare Dashboard 进入你的域名 DNS 管理页
-2. 添加一个 CNAME 记录，如 `api.yourdomain.com` → `glm-free-api-worker.your-subdomain.workers.dev`
-3. 进入 Worker 设置 → Triggers → Custom Domains，添加 `api.yourdomain.com`
+### 工具调用
 
-### 模型列表
+智谱清言网页版 API 不原生支持 Function Calling，本项目通过 Prompt Engineering 实现：
 
-支持通过标准接口查询可用模型：
+1. 请求前将工具定义以结构化英文指令注入 `system` 消息
+2. 流式输出时智能缓冲，检测并解析工具调用 JSON
+3. Claude 协议的 `tool_use`/`tool_result` 自动双向转换
 
-```bash
-curl https://<your-worker-domain>/v1/models \
-  -H "Authorization: Bearer <your-api-key>"
-```
+### 协议适配
 
-
-### 响应中的 reasoning_content
-
-当模型触发联网搜索或深度思考时，流式响应中会包含 `reasoning_content` 字段：
-
-```json
-{
-  "choices": [{
-    "delta": {
-      "reasoning_content": "> 检索 量子计算最新进展 ..."
-    }
-  }]
-}
-```
-
-客户端可将其渲染为灰色思考过程，与正式回答区分开。
-
-### 工具调用实现机制
-
-由于智谱清言网页版 API 暂不原生支持工具调用，本项目采用 **Prompt Engineering + 后处理解析** 的方案实现兼容：
-
-1. **注入工具描述**：请求前将可用工具的名称、描述、参数结构以结构化英文指令形式注入到 `system` 消息中，并附带 Few-shot 示例，引导模型在需要时输出标准 JSON。
-
-2. **智能流式缓冲**：在流式输出场景下，Worker 会检测输出内容是否以 `{` 开头。若是，则缓冲约 20 个字符后判断其是否为工具调用 JSON；确认后将其解析为 `tool_calls`，避免 JSON 文本泄露到普通 `content` 中。
-
-3. **鲁棒解析**：`parseToolCalls` 函数支持标准 JSON、单引号 JSON 以及无引号 key 的宽松格式；若解析失败，会尝试常见修复策略（补全括号、替换单引号等）后再次解析。
-
-4. **协议转换**：Claude 协议的 `tool_use` / `tool_result` 消息会在进入智谱前被转换为 OpenAI 的 `tool_calls` / `tool` 格式，返回时再转换回去，确保对上层客户端完全透明。
-
-> **已知限制**：工具调用的可靠性取决于模型对 prompt 指令的遵循程度。过于复杂的嵌套参数或含糊的工具描述可能导致解析失败。建议为工具提供清晰、准确的 `description` 和 `parameters` 定义。
+三种协议共享同一套上游调用逻辑，通过 adapter 层转换：
+- OpenAI → 直接透传
+- Claude → `adapters.ts` 的 `convertClaudeToGLM` / `convertGLMToClaude`
+- Gemini → `adapters.ts` 的 `convertGeminiToGLM` / `convertGLMToGemini`
 
 ---
-
 
 ## 技术栈
 
-- **运行时**：Cloudflare Workers (V8 Isolate)
-- **语言**：TypeScript
-- **存储**：Cloudflare KV（Token 映射）、Cache API（access_token 缓存）
-- **流式处理**：Web Streams API + 手写 SSE 解析器
+- **运行时** — Cloudflare Workers (V8) / Node.js (VPS)
+- **语言** — TypeScript
+- **存储** — Cloudflare KV / 本地 `tokens.json`
+- **自动化** — Puppeteer-core（VPS 自动获取 Token）
+- **流式处理** — Web Streams API + SSE 解析器
 
 ---
 
 ## 免责声明
 
 本项目仅供学习研究交流使用，不提供任何担保。使用本服务产生的任何法律责任由使用者自行承担。请遵守智谱清言的用户协议及相关法律法规。
-
-# 链接
-
-Linux.do 社区，互联网上唯一的净土！
