@@ -275,18 +275,32 @@ function sseResponse(res: http.ServerResponse, stream: ReadableStream) {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
     ...corsHeaders(),
   });
 
+  // 心跳保活，防止 Claude Code 等客户端因超时断开
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) res.write(": heartbeat\n\n");
+  }, 15000);
+
   const reader = stream.getReader();
   const pump = async () => {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) { res.end(); break; }
-      res.write(value);
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!res.writableEnded) res.write(value);
+      }
+    } finally {
+      clearInterval(heartbeat);
+      if (!res.writableEnded) res.end();
     }
   };
-  pump().catch(() => res.end());
+  pump().catch(() => {
+    clearInterval(heartbeat);
+    if (!res.writableEnded) res.end();
+  });
 }
 
 function readBody(req: http.IncomingMessage): Promise<any> {

@@ -337,7 +337,7 @@ async function checkResult(response: Response, refreshToken: string): Promise<an
   throw new Error(`[请求glm失败]: ${message}`);
 }
 
-async function glmPostStream(url: string, body: any, headers: Record<string, string>, timeout = 120000): Promise<Response> {
+async function glmPostStream(url: string, body: any, headers: Record<string, string>, timeout = 180000): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   try {
@@ -1031,7 +1031,12 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
       });
       try {
         while (true) {
-          const { done, value } = await reader.read();
+          // 60秒读取超时，防止上游无响应时卡死
+          const readPromise = reader.read();
+          const timeoutPromise = new Promise<{ done: true; value: undefined }>((_, reject) =>
+            setTimeout(() => reject(new Error("Stream read timeout: 60s no data")), 60000)
+          );
+          const { done, value } = await Promise.race([readPromise, timeoutPromise]);
           if (done) { controller.close(); break; }
           parser.feed(decoder.decode(value, { stream: true }));
         }
