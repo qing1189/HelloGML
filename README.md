@@ -188,37 +188,62 @@ npx wrangler dev --local
 fetch("http://your-server:38412/token/auto-fetch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({refresh_token:document.cookie.match(/chatglm_refresh_token=([^;]+)/)?.[1]||""})}).then(r=>r.json()).then(d=>alert(d.success?"添加成功":"失败: "+d.message))
 ```
 
-### 管理页面
+### 管理面板
 
-访问 `http://your-server:38412/token/fetch-helper` 可视化管理 Token，支持自动获取、手动添加、删除。
+访问 `http://your-server:38412/admin` 打开完整管理面板，可视化操作：
 
-### API 接口
+- **API Key 管理** — 添加/查看/删除调用密钥
+- **Token 池管理** — 添加/查看/删除/检测 refresh_token
+- **Token 自动获取** — 一键从 chatglm.cn 获取（需 Chrome）
 
-#### 添加 Token
+也可通过 `http://your-server:38412/token/fetch-helper` 访问简易 Token 管理页面。
+
+### API Key 管理
+
+未配置任何 API Key 时，请求中传入任意非空字符串即可通过认证。配置了 API Key 后，只有白名单内的 Key 才能调用 API。
 
 ```bash
-curl -X POST http://your-server:38412/token/auto-fetch \
+# 添加
+curl -X POST http://your-server:38412/admin/apikey \
   -H "Content-Type: application/json" \
+  -H "X-Admin-Key: your-admin-key" \
+  -d '{"api_key":"sk-my-key"}'
+
+# 查看
+curl http://your-server:38412/admin/apikey -H "X-Admin-Key: your-admin-key"
+
+# 删除
+curl -X DELETE http://your-server:38412/admin/apikey \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: your-admin-key" \
+  -d '{"api_key":"sk-my-key"}'
+```
+
+### Token 池管理
+
+```bash
+# 添加 Token
+curl -X POST http://your-server:38412/admin/token \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: your-admin-key" \
   -d '{"refresh_token":"eyJhbG..."}'
-```
 
-#### 查看 Token 池
+# 查看池
+curl http://your-server:38412/admin/token -H "X-Admin-Key: your-admin-key"
 
-```bash
-curl http://your-server:38412/token/list
-```
-
-#### 删除 Token
-
-```bash
-curl -X POST http://your-server:38412/token/delete \
+# 删除
+curl -X DELETE http://your-server:38412/admin/token \
   -H "Content-Type: application/json" \
+  -H "X-Admin-Key: your-admin-key" \
   -d '{"id":"tk_xxx"}'
-```
 
-#### 立即自动获取
+# 检测 Token 有效性
+curl -X POST http://your-server:38412/admin/token/check \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: your-admin-key" \
+  -d '{"id":"tk_xxx"}'
 
-```bash
+# 立即自动获取
 curl -X POST http://your-server:38412/token/auto-fetch-now
 ```
 
@@ -233,7 +258,7 @@ curl -X POST http://your-server:38412/token/auto-fetch-now
 
 ## API 参考
 
-所有接口均需认证，通过 `Authorization: Bearer <api_key>` 传入任意非空字符串即可。
+所有 API 接口均需认证。未配置 API Key 时传入任意非空字符串即可；配置后需传入白名单内的 Key。
 
 ### 支持的模型
 

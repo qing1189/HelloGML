@@ -43,6 +43,7 @@ import {
   createClaudeCompletion,
   createGeminiCompletion,
 } from "./src/adapters.ts";
+import { getAdminPanelHTML } from "./src/admin-panel.ts";
 
 // ==================== 配置 ====================
 
@@ -96,6 +97,22 @@ function removeToken(id: string) {
 }
 
 let roundRobinIdx = 0;
+
+// ==================== API Key 存储 ====================
+
+let apiKeys: string[] = [];
+
+function loadApiKeys() {
+  try {
+    const file = path.join(import.meta.dirname || ".", "apikeys.json");
+    if (fs.existsSync(file)) apiKeys = JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch { apiKeys = []; }
+}
+
+function saveApiKeys() {
+  const file = path.join(import.meta.dirname || ".", "apikeys.json");
+  fs.writeFileSync(file, JSON.stringify(apiKeys, null, 2));
+}
 
 function selectToken(): TokenEntry | null {
   const active = tokenPool.filter((t) => t.failCount < 3);
@@ -273,9 +290,19 @@ function extractAPIKeys(req: http.IncomingMessage): string[] {
 }
 
 function checkAuth(req: http.IncomingMessage): boolean {
+  // 若未配置任何 api_key，任意非空 key 均可通过
+  if (apiKeys.length === 0) {
+    const keys = extractAPIKeys(req);
+    return keys.some((k) => k.length > 0);
+  }
   const keys = extractAPIKeys(req);
-  // 简单 API Key 验证（生产环境建议改为哈希比对）
-  return keys.some((k) => k.length > 0);
+  return keys.some((k) => apiKeys.includes(k));
+}
+
+function checkAdmin(req: http.IncomingMessage): boolean {
+  const key = req.headers["x-admin-key"] || "";
+  if (!ADMIN_KEY || ADMIN_KEY === "changeme") return true;
+  return key === ADMIN_KEY;
 }
 
 // ==================== 路由处理 ====================
@@ -299,7 +326,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // ===== 公开接口 =====
     if (p === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "text/html", ...corsHeaders() });
-      res.end(`<html><body><h1>GLM Free API Server</h1><p>Token pool: ${tokenPool.length} tokens</p><p><a href="/token/fetch-helper">Token 管理</a></p></body></html>`);
+      res.end(`<html><body><h1>GLM Free API Server</h1><p>Token pool: ${tokenPool.length} tokens</p><p><a href="/admin">管理面板</a></p></body></html>`);
       return;
     }
 
@@ -363,9 +390,80 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return;
     }
 
+    // ===== 管理面板 =====
+    if (p === "/admin" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "text/html", ...corsHeaders() });
+      res.end(getAdminPanelHTML());
+      return;
+    }
+
+    if (p === "/admin/apikey") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        if (!body.api_key) { errorResponse(res, "Missing api_key"); return; }
+        if (!apiKeys.includes(body.api_key)) { apiKeys.push(body.api_key); saveApiKeys(); }
+        jsonResponse(res, { success: true, message: "API key added successfully" });
+        return;
+      }
+      if (req.method === "GET") {
+        jsonResponse(res, { keys: apiKeys.map((k) => ({ api_key: k })) });
+        return;
+      }
+      if (req.method === "DELETE") {
+        const body = await readBody(req);
+        if (!body.api_key) { errorResponse(res, "Missing api_key"); return; }
+        apiKeys = apiKeys.filter((k) => k !== body.api_key);
+        saveApiKeys();
+        jsonResponse(res, { success: true, message: "API key deleted" });
+        return;
+      }
+    }
+
+    if (p === "/admin/token") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        if (!body.refresh_token) { errorResponse(res, "Missing refresh_token"); return; }
+        const live = await getTokenLiveStatus(body.refresh_token);
+        if (!live) { errorResponse(res, "Token 无效"); return; }
+        const id = addToken(body.refresh_token);
+        jsonResponse(res, { success: true, message: "Token added to pool", id });
+        return;
+      }
+      if (req.method === "GET") {
+        jsonResponse(res, {
+          tokens: tokenPool.map((t) => ({
+            id: t.id,
+            token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4),
+            failCount: t.failCount,
+          })),
+        });
+        return;
+      }
+      if (req.method === "DELETE") {
+        const body = await readBody(req);
+        if (!body.id) { errorResponse(res, "Missing id"); return; }
+        removeToken(body.id);
+        jsonResponse(res, { success: true, message: "Token removed" });
+        return;
+      }
+    }
+
+    if (p === "/admin/token/check" && req.method === "POST") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      const body = await readBody(req);
+      if (!body.id) { errorResponse(res, "Missing id"); return; }
+      const entry = tokenPool.find((t) => t.id === body.id);
+      if (!entry) { errorResponse(res, "Token not found", 404); return; }
+      const live = await getTokenLiveStatus(entry.token);
+      jsonResponse(res, { id: body.id, live });
+      return;
+    }
+
     // ===== API 接口（需要认证） =====
     if (!checkAuth(req)) {
-      errorResponse(res, "Missing Authorization header", 401);
+      errorResponse(res, "Unauthorized: invalid or missing API key", 401);
       return;
     }
 
@@ -536,7 +634,9 @@ loadList();
 const server = http.createServer(handleRequest);
 
 loadTokens();
+loadApiKeys();
 console.error(`[Server] Token 池: ${tokenPool.length} 个 token`);
+console.error(`[Server] API Keys: ${apiKeys.length} 个`);
 
 // 首次启动时如果池为空，尝试自动获取
 if (tokenPool.length === 0) {
