@@ -78,7 +78,9 @@ docker compose up -d
 | `PORT` | `38412` | 监听端口 |
 | `CHROME_PATH` | `/usr/bin/chromium` | Chrome 路径（容器内已内置） |
 | `SIGN_SECRET` | `8a1317a7468aa3ad86e997d08f3f31cb` | 签名密钥 |
-| `ADMIN_KEY` | `changeme` | 管理接口密钥，**生产环境务必修改** |
+| `ADMIN_KEY` | `changeme` | 管理员密钥，用于管理面板登录和所有 `/admin/*`、`/token/*` 接口的鉴权 |
+
+> **默认密钥是 `changeme`**。Docker 部署时通过 `-e ADMIN_KEY=你的密码` 修改，裸机部署通过环境变量修改。**生产环境务必修改为强密码**，否则任何人知道默认值即可管理你的 Token。
 
 ### 裸机部署
 
@@ -198,7 +200,7 @@ fetch("http://your-server:38412/token/auto-fetch",{method:"POST",headers:{"Conte
 | `http://your-server:38412/token/fetch-helper` | **简易 Token 管理** — 手动添加、一键提取、自动获取 |
 | `http://your-server:38412/` | 首页，显示 Token 池状态和链接 |
 
-**管理面板登录**：如果设置了 `ADMIN_KEY` 环境变量，首次访问 `/admin` 时需要输入密钥。未设置或为默认值 `changeme` 时可直接访问。
+**管理面板登录**：首次访问管理面板需要输入 `ADMIN_KEY`（默认 `changeme`），输入后自动保存到浏览器。所有管理操作（添加/删除 Token、管理 API Key）都需要此密钥。API 调用接口则使用独立的 API Key 认证。
 
 **管理面板功能**：
 
@@ -213,7 +215,11 @@ fetch("http://your-server:38412/token/auto-fetch",{method:"POST",headers:{"Conte
 
 ### API Key 管理
 
-未配置任何 API Key 时，请求中传入任意非空字符串即可通过认证。配置了 API Key 后，只有白名单内的 Key 才能调用 API。
+API Key 用于调用 `/v1/chat/completions` 等对话接口的身份认证。与 `ADMIN_KEY`（管理员密钥）是独立的。
+
+**初始状态**：未配置任何 API Key 时，请求中传入任意非空字符串即可通过认证（如 `Authorization: Bearer any-key`）。
+
+**配置后**：只有白名单内的 Key 才能调用 API。
 
 ```bash
 # 添加
@@ -271,7 +277,7 @@ curl -X POST http://your-server:38412/token/auto-fetch-now
 
 ## API 参考
 
-所有 API 接口均需认证。未配置 API Key 时传入任意非空字符串即可；配置后需传入白名单内的 Key。
+所有 API 接口均需认证。未在管理面板配置 API Key 时，传入任意非空字符串即可（如 `Bearer any-key`）；配置后需传入白名单内的 Key。管理接口使用 `ADMIN_KEY`（默认 `changeme`），对话接口使用 API Key，两者独立。
 
 ### 支持的模型
 
