@@ -19,82 +19,6 @@ import {
 import { WELCOME_HTML } from "./welcome.ts";
 import { getAdminPanelHTML } from "./admin-panel.ts";
 
-function getTokenFetchHTML(origin: string): string {
-  return `<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Auto-Fetch Helper</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center}
-.card{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:32px;max-width:560px;width:90%}
-h1{font-size:20px;margin-bottom:16px;color:#fff}
-.step{background:#222;border-radius:8px;padding:16px;margin-bottom:12px;font-size:14px;line-height:1.6}
-.step b{color:#4fc3f7}
-.code{background:#111;border:1px solid #444;border-radius:6px;padding:12px;font-family:monospace;font-size:12px;color:#a5d6a7;word-break:break-all;white-space:pre-wrap;position:relative;cursor:pointer}
-.code:hover{border-color:#4fc3f7}
-.btn{display:inline-block;background:#4fc3f7;color:#000;border:none;padding:10px 20px;border-radius:6px;font-size:14px;cursor:pointer;font-weight:600}
-.btn:hover{background:#81d4fa}
-.btn:disabled{background:#555;color:#999;cursor:not-allowed}
-.status{margin-top:12px;padding:12px;border-radius:6px;font-size:13px;display:none}
-.status.ok{display:block;background:#1b3a1b;border:1px solid #2e7d32;color:#a5d6a7}
-.status.err{display:block;background:#3a1b1b;border:1px solid #c62828;color:#ef9a9a}
-.tip{font-size:12px;color:#888;margin-top:8px}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>Token Auto-Fetch Helper</h1>
-<div class="step">
-<b>Step 1:</b> Visit <a href="https://chatglm.cn/main/alltoolsdetail" target="_blank" style="color:#4fc3f7">chatglm.cn</a> in your browser (no login needed)
-</div>
-<div class="step">
-<b>Step 2:</b> Open browser DevTools (F12) \u2192 Console, paste and run:
-<div class="code" onclick="copySnippet()" id="snippet">fetch("/token/auto-fetch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({refresh_token:document.cookie.match(/chatglm_refresh_token=([^;]+)/)?.[1]||""})}).then(r=>r.json()).then(d=>alert(d.success?"Token added! ID:"+d.id:"Error:"+d.message)).catch(e=>alert("Error:"+e))</div>
-<div class="tip">Click to copy \u2022 Or use the auto method below</div>
-</div>
-<div class="step">
-<b>Step 3 (Auto):</b> If you have the token already, paste it here:
-<div style="margin-top:8px;display:flex;gap:8px">
-<input type="text" id="tokenInput" placeholder="paste chatglm_refresh_token here" style="flex:1;background:#111;border:1px solid #444;border-radius:6px;padding:8px;color:#e0e0e0;font-size:13px">
-<button class="btn" onclick="submitToken()">Submit</button>
-</div>
-</div>
-<div class="status" id="status"></div>
-<div class="step" style="margin-top:16px">
-<b>Bookmarklet:</b> Drag this link to your bookmarks bar, then click it on chatglm.cn page:
-<div style="margin-top:8px">
-<a href="javascript:void(function(){var t=document.cookie.match(/chatglm_refresh_token=([^;]+)/);if(!t){alert('No chatglm_refresh_token cookie found');return}fetch('${origin}/token/auto-fetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:t[1]})}).then(r=>r.json()).then(function(d){alert(d.success?'Token added! ID:'+d.id:'Error:'+d.message)}).catch(function(e){alert('Error:'+e)})}())" style="color:#4fc3f7;font-size:13px">\ud83d\ude80 Auto-Fetch GLM Token</a>
-</div>
-</div>
-</div>
-<script>
-function copySnippet(){
-var el=document.getElementById('snippet');
-var text=el.textContent;
-var workerOrigin=location.origin;
-text=text.replace('/token/auto-fetch',workerOrigin+'/token/auto-fetch');
-navigator.clipboard.writeText(text).then(function(){el.style.borderColor='#4fc3f7';setTimeout(function(){el.style.borderColor='#444'},1000)})
-}
-function submitToken(){
-var t=document.getElementById('tokenInput').value.trim();
-if(!t){showStatus('Please paste a token','err');return}
-fetch('/token/auto-fetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:t})}).then(r=>r.json()).then(function(d){
-if(d.success){showStatus('Token added! ID: '+d.id,'ok')}else{showStatus('Error: '+d.message,'err')}
-}).catch(function(e){showStatus('Error: '+e,'err')})
-}
-function showStatus(msg,type){
-var el=document.getElementById('status');
-el.textContent=msg;
-el.className='status '+type
-}
-</script>
-</body>
-</html>`;
-}
-
 export interface Env {
   SIGN_SECRET?: string;
   ADMIN_KEY?: string;
@@ -533,11 +457,15 @@ export default {
         response = await handleTokenCheck(request, env);
       } else if (path === "/token/auto-fetch" && request.method === "POST") {
         response = await handleAutoFetchToken(request, env);
-      } else if (path === "/token/fetch-helper" && request.method === "GET") {
-        const origin = url.origin;
-        response = new Response(getTokenFetchHTML(origin), {
-          headers: { "Content-Type": "text/html", ...corsHeaders() },
-        });
+      } else if (path === "/token/auto-fetch-now" && request.method === "POST") {
+        // 自动获取 Token（需要 Admin Key）
+        const adminKey = request.headers.get("X-Admin-Key") || "";
+        if (env.ADMIN_KEY && adminKey !== env.ADMIN_KEY) {
+          response = errorResponse("Unauthorized: invalid admin key", 401);
+        } else {
+          // CF Worker 不支持 Puppeteer，返回提示
+          response = errorResponse("自动获取功能仅支持 VPS/Docker 部署，请手动添加 Token", 400);
+        }
       } else if (path === "/admin/apikey") {
         response = await handleAdminAPIKey(request, env);
       } else if (path === "/admin/token") {

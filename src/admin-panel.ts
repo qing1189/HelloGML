@@ -496,8 +496,8 @@ export function getAdminPanelHTML(): string {
   <!-- Token Pool Section -->
   <div class="section" id="section-tokens">
     <div class="card">
-      <div class="card-title">添加 Refresh Token</div>
-      <p style="color:var(--ink-faint);font-size:0.85rem;margin-bottom:1rem;">所有添加的 Token 会组成一个公共池，系统按轮询策略自动调度。</p>
+      <div class="card-title">手动添加 Token</div>
+      <p style="color:var(--ink-faint);font-size:0.85rem;margin-bottom:1rem;">浏览器打开 <a href="https://chatglm.cn" target="_blank" style="color:var(--gold)">chatglm.cn</a> → F12 → Application → Cookies → 复制 <code>chatglm_refresh_token</code> 的值</p>
       <div class="form-group">
         <label class="form-label">Refresh Token</label>
         <textarea class="form-textarea" id="newRefreshToken" placeholder="粘贴智谱清言的 chatglm_refresh_token..."></textarea>
@@ -506,6 +506,25 @@ export function getAdminPanelHTML(): string {
         <button class="btn btn-primary" onclick="addToken()">添加到池</button>
         <button class="btn btn-secondary" onclick="clearTokenForm()">清空</button>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">浏览器一键提取</div>
+      <p style="color:var(--ink-faint);font-size:0.85rem;margin-bottom:1rem;">在 chatglm.cn 页面的控制台 (F12) 运行以下代码，自动提取并提交 Token：</p>
+      <div class="code-block" id="consoleSnippet" style="cursor:pointer;position:relative;" onclick="copySnippet()">
+        <span id="snippetContent"></span>
+      </div>
+      <div style="display:flex;gap:0.6rem;margin-top:0.8rem;">
+        <button class="btn btn-secondary" onclick="copySnippet()">复制代码</button>
+      </div>
+      <div id="snippetStatus" style="display:none;margin-top:0.6rem;padding:0.6rem;border-radius:6px;font-size:0.85rem;"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">自动获取 <span class="badge" style="background:var(--gold-light);color:var(--ink);font-size:0.7rem;padding:2px 8px;margin-left:6px;">Docker/VPS</span></div>
+      <p style="color:var(--ink-faint);font-size:0.85rem;margin-bottom:1rem;">需要服务器安装 Chromium（Docker 镜像已内置）。点击按钮自动从 chatglm.cn 获取 refresh_token。裸机部署需先安装：<code>apt install chromium</code></p>
+      <button class="btn btn-primary" onclick="autoFetchToken()">自动获取</button>
+      <div id="autoFetchStatus" style="display:none;margin-top:0.6rem;padding:0.6rem;border-radius:6px;font-size:0.85rem;"></div>
     </div>
 
     <div class="card">
@@ -689,6 +708,7 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
       $('loginModal').classList.remove('show');
       showToast('登录成功', 'success');
       loadDashboard();
+      updateSnippetUrl();
     } catch (e) {
       $('loginError').style.display = 'block';
       input.value = '';
@@ -859,6 +879,50 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
     $('newRefreshToken').value = '';
   };
 
+  // ==================== 浏览器提取 & 自动获取 ====================
+
+  function updateSnippetUrl() {
+    const base = getBaseUrl();
+    const code = 'fetch("' + base + '/token/auto-fetch",{method:"POST",headers:{"Content-Type":"application/json","X-Admin-Key":"' + adminKey + '"},body:JSON.stringify({refresh_token:document.cookie.match(/chatglm_refresh_token=([^;]+)/)?.[1]||""})}).then(r=>r.json()).then(d=>alert(d.success?"Token added! ID:"+d.id:"Error:"+d.message))';
+    $('snippetContent').textContent = code;
+  }
+
+  window.copySnippet = function() {
+    const text = $('snippetContent').textContent;
+    navigator.clipboard.writeText(text).then(function() {
+      showToast('代码已复制到剪贴板', 'success');
+    }).catch(function() {
+      showToast('复制失败，请手动复制', 'error');
+    });
+  };
+
+  window.autoFetchToken = async function() {
+    const statusEl = $('autoFetchStatus');
+    statusEl.style.display = 'block';
+    statusEl.style.background = 'var(--parchment-dark)';
+    statusEl.style.color = 'var(--ink)';
+    statusEl.textContent = '正在获取 Token...';
+
+    try {
+      const data = await api('/token/auto-fetch-now', { method: 'POST' });
+      if (data.success) {
+        statusEl.style.background = 'rgba(90,125,74,0.15)';
+        statusEl.style.color = 'var(--green)';
+        statusEl.textContent = '获取成功! Token ID: ' + data.id;
+        loadTokens();
+        loadDashboard();
+      } else {
+        statusEl.style.background = 'rgba(139,58,58,0.15)';
+        statusEl.style.color = 'var(--crimson)';
+        statusEl.textContent = '获取失败: ' + (data.message || '未知错误');
+      }
+    } catch (e) {
+      statusEl.style.background = 'rgba(139,58,58,0.15)';
+      statusEl.style.color = 'var(--crimson)';
+      statusEl.textContent = '获取失败: ' + e.message;
+    }
+  };
+
   function maskKey(key) {
     if (key.length <= 8) return key;
     return key.slice(0, 6) + '****' + key.slice(-4);
@@ -877,6 +941,7 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
       // 验证存储的key是否仍有效
       api('/admin/token', { method: 'GET' }).then(() => {
         loadDashboard();
+        updateSnippetUrl();
       }).catch(() => {
         localStorage.removeItem(ADMIN_KEY_KEY);
         adminKey = '';
