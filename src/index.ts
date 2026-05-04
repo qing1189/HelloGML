@@ -492,7 +492,9 @@ export default {
     if (env.SIGN_SECRET) setSignSecret(env.SIGN_SECRET);
 
     const url = new URL(request.url);
-    const path = url.pathname;
+    let path = url.pathname;
+    // 去除末尾斜杠，但保留根路径 "/"
+    if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });

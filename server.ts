@@ -333,7 +333,9 @@ const SUPPORTED_MODELS = [
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
   const url = new URL(req.url || "/", `http://${req.headers.host}`);
-  const p = url.pathname;
+  let p = url.pathname;
+  // 去除末尾斜杠，但保留根路径 "/"
+  if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
 
   // CORS preflight
   if (req.method === "OPTIONS") {
