@@ -190,13 +190,26 @@ fetch("http://your-server:38412/token/auto-fetch",{method:"POST",headers:{"Conte
 
 ### 管理面板
 
-访问 `http://your-server:38412/admin` 打开完整管理面板，可视化操作：
+部署后可通过以下地址访问管理界面：
 
-- **API Key 管理** — 添加/查看/删除调用密钥
-- **Token 池管理** — 添加/查看/删除/检测 refresh_token
-- **Token 自动获取** — 一键从 chatglm.cn 获取（需 Chrome）
+| 地址 | 说明 |
+|------|------|
+| `http://your-server:38412/admin` | **完整管理面板** — API Key 管理、Token 池管理、Token 有效性检测 |
+| `http://your-server:38412/token/fetch-helper` | **简易 Token 管理** — 手动添加、一键提取、自动获取 |
+| `http://your-server:38412/` | 首页，显示 Token 池状态和链接 |
 
-也可通过 `http://your-server:38412/token/fetch-helper` 访问简易 Token 管理页面。
+**管理面板登录**：如果设置了 `ADMIN_KEY` 环境变量，首次访问 `/admin` 时需要输入密钥。未设置或为默认值 `changeme` 时可直接访问。
+
+**管理面板功能**：
+
+- **API Key 管理** — 添加/查看/删除调用密钥，未配置 Key 时任意非空字符串均可认证
+- **Token 池管理** — 添加/查看/删除 refresh_token，检测 Token 有效性
+- **Token 状态概览** — 查看 Token 数量、失败次数、最后使用时间
+
+**简易 Token 管理页面**（`/token/fetch-helper`）提供更直观的 Token 获取引导：
+- 手动粘贴添加（推荐）
+- 浏览器控制台一键提取脚本（推荐）
+- 自动获取（Docker 环境，容器内已内置 Chromium）
 
 ### API Key 管理
 
