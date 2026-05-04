@@ -321,7 +321,7 @@ function checkAuth(req: http.IncomingMessage): boolean {
 
 function checkAdmin(req: http.IncomingMessage): boolean {
   const key = req.headers["x-admin-key"] || "";
-  if (!ADMIN_KEY || ADMIN_KEY === "changeme") return true;
+  if (!ADMIN_KEY) return true;
   return key === ADMIN_KEY;
 }
 
@@ -361,7 +361,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return;
     }
 
-    // ===== Token 管理 =====
+    // ===== Token 管理（需要 Admin Key）=====
     if (p === "/token/fetch-helper" && req.method === "GET") {
       const origin = `http://${req.headers.host}`;
       res.writeHead(200, { "Content-Type": "text/html", ...corsHeaders() });
@@ -370,6 +370,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     }
 
     if (p === "/token/auto-fetch" && req.method === "POST") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized: 需要管理员密钥", 401); return; }
       const body = await readBody(req);
       const rt = body.refresh_token;
       if (!rt) { errorResponse(res, "Missing refresh_token"); return; }
@@ -383,6 +384,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     }
 
     if (p === "/token/list" && req.method === "GET") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized: 需要管理员密钥", 401); return; }
       jsonResponse(res, {
         tokens: tokenPool.map((t) => ({
           id: t.id,
@@ -395,6 +397,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     }
 
     if (p === "/token/delete" && req.method === "POST") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized: 需要管理员密钥", 401); return; }
       const body = await readBody(req);
       if (!body.id) { errorResponse(res, "Missing id"); return; }
       removeToken(body.id);
@@ -403,6 +406,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     }
 
     if (p === "/token/auto-fetch-now" && req.method === "POST") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized: 需要管理员密钥", 401); return; }
       const token = await autoFetchToken();
       if (!token) { errorResponse(res, "自动获取失败，请确认 Chrome 已安装", 500); return; }
       const id = addToken(token);
@@ -652,6 +656,14 @@ h1{font-size:22px;margin-bottom:20px;color:#fff}
 <h1>GLM Token 管理</h1>
 
 <div class="card">
+<h2>管理员密钥</h2>
+<p class="step">操作 Token 需要管理员密钥（环境变量 <code>ADMIN_KEY</code>），输入后自动保存到浏览器</p>
+<input class="input" id="keyInput" placeholder="输入管理员密钥" style="display:none">
+<button class="btn" onclick="setKey()">保存密钥</button>
+<span id="keyStatus" style="color:#a5d6a7;font-size:13px;margin-left:8px"></span>
+</div>
+
+<div class="card">
 <h2>手动添加 Token <span class="tag green">推荐</span></h2>
 <p class="step"><b>步骤：</b>浏览器打开 <a href="https://chatglm.cn" target="_blank" style="color:#4fc3f7">chatglm.cn</a> → F12 → Application → Cookies → 复制 <code>chatglm_refresh_token</code> 的值，粘贴到下方</p>
 <input class="input" id="tokenInput" placeholder="粘贴 chatglm_refresh_token 的值">
@@ -682,14 +694,51 @@ h1{font-size:22px;margin-bottom:20px;color:#fff}
 
 <script>
 var origin = location.origin;
+var AK_KEY = 'glm_admin_key';
+var adminKey = localStorage.getItem(AK_KEY) || '';
+if(adminKey){
+  document.getElementById('keyInput').style.display='none';
+  document.getElementById('keyStatus').textContent='密钥已保存';
+}
+
 document.getElementById('snippet').textContent =
-  'fetch("'+origin+'/token/auto-fetch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({refresh_token:document.cookie.match(/chatglm_refresh_token=([^;]+)/)?.[1]||""})}).then(r=>r.json()).then(d=>alert(d.success?"添加成功":"失败: "+d.message))';
+  'fetch("'+origin+'/token/auto-fetch",{method:"POST",headers:{"Content-Type":"application/json","X-Admin-Key":"'+(adminKey||"YOUR_ADMIN_KEY")+'"},body:JSON.stringify({refresh_token:document.cookie.match(/chatglm_refresh_token=([^;]+)/)?.[1]||""})}).then(r=>r.json()).then(d=>alert(d.success?"添加成功":"失败: "+d.message))';
 
 function show(id,msg,type){var el=document.getElementById(id);el.textContent=msg;el.className='status '+type}
 
+function getHeaders(extra){
+  var h = {'Content-Type':'application/json'};
+  if(adminKey) h['X-Admin-Key'] = adminKey;
+  if(extra) for(var k in extra) h[k]=extra[k];
+  return h;
+}
+
+function checkAuth(r){
+  if(r.status===401){
+    adminKey='';
+    localStorage.removeItem(AK_KEY);
+    show('manualStatus','认证失败，请输入管理员密钥','err');
+    document.getElementById('keyInput').style.display='block';
+    return false;
+  }
+  return true;
+}
+
+function setKey(){
+  var k=document.getElementById('keyInput').value.trim();
+  if(!k)return;
+  adminKey=k;
+  localStorage.setItem(AK_KEY,k);
+  document.getElementById('keyInput').style.display='none';
+  loadList();
+}
+
 function autoFetch(){
   show('autoStatus','正在获取...','');
-  fetch('/token/auto-fetch-now',{method:'POST'}).then(r=>r.json()).then(function(d){
+  fetch('/token/auto-fetch-now',{method:'POST',headers:getHeaders()}).then(function(r){
+    if(!checkAuth(r))return;return r.json();
+  }).then(function(d){
+    if(!d)return;
     if(d.success){show('autoStatus','成功! ID: '+d.id,'ok');loadList()}else{show('autoStatus','失败: '+d.message,'err')}
   }).catch(function(e){show('autoStatus','错误: '+e,'err')})
 }
@@ -697,7 +746,10 @@ function autoFetch(){
 function manualAdd(){
   var t=document.getElementById('tokenInput').value.trim();
   if(!t){show('manualStatus','请输入 token','err');return}
-  fetch('/token/auto-fetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:t})}).then(r=>r.json()).then(function(d){
+  fetch('/token/auto-fetch',{method:'POST',headers:getHeaders(),body:JSON.stringify({refresh_token:t})}).then(function(r){
+    if(!checkAuth(r))return;return r.json();
+  }).then(function(d){
+    if(!d)return;
     if(d.success){show('manualStatus','添加成功! ID: '+d.id,'ok');document.getElementById('tokenInput').value='';loadList()}else{show('manualStatus','失败: '+d.message,'err')}
   }).catch(function(e){show('manualStatus','错误: '+e,'err')})
 }
@@ -708,8 +760,12 @@ function copySnippet(){
 }
 
 function loadList(){
-  fetch('/token/list').then(r=>r.json()).then(function(d){
+  fetch('/token/list',{headers:getHeaders()}).then(function(r){
+    if(!checkAuth(r))return;return r.json();
+  }).then(function(d){
+    if(!d)return;
     var el=document.getElementById('tokenList');
+    if(!d.tokens){el.innerHTML='<div style="color:#888;font-size:13px">暂无 token</div>';return}
     if(!d.tokens.length){el.innerHTML='<div style="color:#888;font-size:13px">暂无 token</div>';return}
     el.innerHTML=d.tokens.map(function(t){
       return '<div class="token-item"><div class="info"><span class="id">'+t.id+'</span> <span class="preview">'+t.preview+'</span>'+(t.failCount?' <span class="fail">失败'+t.failCount+'次</span>':'')+'</div><button class="btn danger" onclick="delToken(\\''+t.id+'\\')">删除</button></div>'
@@ -719,7 +775,9 @@ function loadList(){
 
 function delToken(id){
   if(!confirm('确认删除?'))return;
-  fetch('/token/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})}).then(r=>r.json()).then(function(){loadList()})
+  fetch('/token/delete',{method:'POST',headers:getHeaders(),body:JSON.stringify({id:id})}).then(function(r){
+    if(!checkAuth(r))return;return r.json();
+  }).then(function(d){if(d)loadList()})
 }
 
 loadList();
