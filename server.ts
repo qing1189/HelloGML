@@ -165,7 +165,16 @@ async function autoFetchToken(): Promise<string | null> {
   try {
     puppeteer = await import("puppeteer-core");
   } catch {
-    console.error("[AutoFetch] puppeteer-core 未安装，跳过自动获取。运行: npm i puppeteer-core");
+    console.error("[AutoFetch] puppeteer-core 未安装，跳过自动获取");
+    return null;
+  }
+
+  // 检查浏览器是否存在
+  const browserExists = fs.existsSync(CHROME_PATH);
+  if (!browserExists) {
+    console.error(`[AutoFetch] 浏览器未找到: ${CHROME_PATH}`);
+    console.error("[AutoFetch] Docker 部署: 容器内已内置 Chromium");
+    console.error("[AutoFetch] 裸机部署: apt install chromium 或设置 CHROME_PATH 环境变量");
     return null;
   }
 
@@ -175,19 +184,30 @@ async function autoFetchToken(): Promise<string | null> {
     browser = await puppeteer.default.launch({
       executablePath: CHROME_PATH,
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+      ],
     });
 
     const page = await browser.newPage();
-    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36");
+    await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+
+    // 设置合理的超时
+    page.setDefaultTimeout(60000);
 
     await page.goto("https://chatglm.cn/main/alltoolsdetail", {
       waitUntil: "networkidle2",
-      timeout: 30000,
+      timeout: 60000,
     });
 
-    // 等待 WAF 挑战完成
-    await new Promise((r) => setTimeout(r, 3000));
+    // 等待 WAF 挑战完成和 cookie 设置
+    await page.waitForFunction(() => {
+      return document.cookie.includes("chatglm_refresh_token");
+    }, { timeout: 30000 }).catch(() => {});
 
     // 从 cookie 中提取 refresh_token
     const cookies = await page.cookies();
@@ -622,6 +642,9 @@ h1{font-size:22px;margin-bottom:20px;color:#fff}
 .step b{color:#e0e0e0}
 .code{background:#111;border:1px solid #444;border-radius:6px;padding:10px;font-family:monospace;font-size:11px;color:#a5d6a7;word-break:break-all;cursor:pointer;margin:8px 0}
 .code:hover{border-color:#4fc3f7}
+.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:4px;margin-left:6px;vertical-align:middle}
+.tag.green{background:#1b3a1b;color:#a5d6a7}
+.tag.orange{background:#3a2b1b;color:#f0c040}
 </style>
 </head>
 <body>
@@ -629,25 +652,25 @@ h1{font-size:22px;margin-bottom:20px;color:#fff}
 <h1>GLM Token 管理</h1>
 
 <div class="card">
-<h2>自动获取 Token</h2>
-<p class="step">需要服务器安装 Chrome。点击按钮自动从 chatglm.cn 获取 cookie 中的 refresh_token。</p>
-<button class="btn" onclick="autoFetch()">自动获取</button>
-<div class="status" id="autoStatus"></div>
-</div>
-
-<div class="card">
-<h2>手动添加 Token</h2>
-<p class="step"><b>获取方式：</b>浏览器打开 chatglm.cn → F12 → Application → Cookies → 复制 <code>chatglm_refresh_token</code> 的值</p>
+<h2>手动添加 Token <span class="tag green">推荐</span></h2>
+<p class="step"><b>步骤：</b>浏览器打开 <a href="https://chatglm.cn" target="_blank" style="color:#4fc3f7">chatglm.cn</a> → F12 → Application → Cookies → 复制 <code>chatglm_refresh_token</code> 的值，粘贴到下方</p>
 <input class="input" id="tokenInput" placeholder="粘贴 chatglm_refresh_token 的值">
 <button class="btn" onclick="manualAdd()">添加</button>
 <div class="status" id="manualStatus"></div>
 </div>
 
 <div class="card">
-<h2>浏览器一键提取</h2>
-<p class="step">在 chatglm.cn 页面的控制台(F12)运行以下代码：</p>
+<h2>浏览器一键提取 <span class="tag green">推荐</span></h2>
+<p class="step">在 chatglm.cn 页面的控制台(F12)运行以下代码，自动提取并提交：</p>
 <div class="code" onclick="copySnippet()" id="snippet">fetch("${fetchUrl}",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({refresh_token:document.cookie.match(/chatglm_refresh_token=([^;]+)/)?.[1]||""})}).then(r=>r.json()).then(d=>alert(d.success?"添加成功":"失败: "+d.message))</div>
 <button class="btn secondary" onclick="copySnippet()">复制代码</button>
+</div>
+
+<div class="card">
+<h2>自动获取 <span class="tag orange">Docker 专用</span></h2>
+<p class="step">需要服务器安装 Chromium（Docker 镜像已内置）。点击按钮自动从 chatglm.cn 获取 cookie 中的 refresh_token。裸机部署需先安装：<code>apt install chromium</code></p>
+<button class="btn" onclick="autoFetch()">自动获取</button>
+<div class="status" id="autoStatus"></div>
 </div>
 
 <div class="card">
