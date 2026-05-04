@@ -8,6 +8,6 @@ services:
     environment:
       - ADMIN_KEY=changeme
     volumes:
-      - glm-data:/app
-volumes:
-  glm-data:
+      - ./data/tokens.json:/app/tokens.json
+      - ./data/apikeys.json:/app/apikeys.json
+      - ./data/logs:/app/logs

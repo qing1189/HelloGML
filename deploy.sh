@@ -41,6 +41,8 @@ compose stop 2>/dev/null || true
 compose rm -f 2>/dev/null || true
 
 echo "[3/5] 构建并启动..."
+mkdir -p data
+touch data/tokens.json data/apikeys.json
 export ADMIN_KEY
 if ! compose up -d --build; then
   echo "[错误] 构建失败"
