@@ -1031,12 +1031,7 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
       });
       try {
         while (true) {
-          // 60秒读取超时，防止上游无响应时卡死
-          const readPromise = reader.read();
-          const timeoutPromise = new Promise<{ done: true; value: undefined }>((_, reject) =>
-            setTimeout(() => reject(new Error("Stream read timeout: 60s no data")), 60000)
-          );
-          const { done, value } = await Promise.race([readPromise, timeoutPromise]);
+          const { done, value } = await reader.read();
           if (done) { controller.close(); break; }
           parser.feed(decoder.decode(value, { stream: true }));
         }
