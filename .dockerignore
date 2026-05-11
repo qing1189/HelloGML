@@ -1,4 +1,17 @@
 node_modules
+dist
+data
 tokens.json
 apikeys.json
 *.log
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+README.md
+LICENSE
+deploy.sh
+wrangler.toml
+tsconfig.json
+.kiro

@@ -41,7 +41,7 @@ compose stop 2>/dev/null || true
 compose rm -f 2>/dev/null || true
 
 echo "[3/5] 构建并启动..."
-mkdir -p data data/logs
+mkdir -p data
 # 修复历史遗留问题：如果早期部署用的是单文件挂载，tokens.json / apikeys.json 可能被 Docker 创建成了目录
 for f in data/tokens.json data/apikeys.json; do
   if [ -d "$f" ]; then
@@ -49,6 +49,8 @@ for f in data/tokens.json data/apikeys.json; do
     rm -rf "$f"
   fi
 done
+# 确保 ./data 对容器内非 root 用户（uid=1000）可写
+chown -R 1000:1000 data 2>/dev/null || chmod -R 777 data
 export ADMIN_KEY
 if ! compose up -d --build; then
   echo "[错误] 构建失败"
