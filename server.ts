@@ -50,8 +50,28 @@ import { getAdminPanelHTML } from "./src/admin-panel.ts";
 const PORT = parseInt(process.env.PORT || "38412");
 const SIGN_SECRET = process.env.SIGN_SECRET || "8a1317a7468aa3ad86e997d08f3f31cb";
 const ADMIN_KEY = process.env.ADMIN_KEY || "changeme";
-const TOKEN_FILE = path.join(import.meta.dirname || ".", "tokens.json");
+// 数据目录：优先使用 DATA_DIR 环境变量（Docker 中为 /app/data），否则回退到脚本所在目录（兼容裸机部署）
+const DATA_DIR = process.env.DATA_DIR || (import.meta.dirname || ".");
+try {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch (e: any) {
+  console.error(`[Server] 创建数据目录失败: ${DATA_DIR}`, e.message);
+}
+const TOKEN_FILE = path.join(DATA_DIR, "tokens.json");
+const APIKEY_FILE = path.join(DATA_DIR, "apikeys.json");
 const CHROME_PATH = process.env.CHROME_PATH || "/usr/bin/google-chrome-stable";
+
+// 防御性检查：如果 tokens.json / apikeys.json 被 Docker 单文件挂载错误地创建成了目录，提前报错并提示修复方法
+for (const f of [TOKEN_FILE, APIKEY_FILE]) {
+  try {
+    if (fs.existsSync(f) && fs.statSync(f).isDirectory()) {
+      console.error(`[Server] 致命错误: ${f} 是一个目录而不是文件。`);
+      console.error(`[Server] 这通常是由 docker-compose 的单文件挂载导致的。`);
+      console.error(`[Server] 修复方法：停止容器 -> rm -rf ${f} -> 重新拉取最新 docker-compose.yml（目录挂载） -> docker-compose up -d`);
+      process.exit(1);
+    }
+  } catch {}
+}
 
 setSignSecret(SIGN_SECRET);
 
@@ -70,7 +90,8 @@ let tokenPool: TokenEntry[] = [];
 function loadTokens() {
   try {
     if (fs.existsSync(TOKEN_FILE)) {
-      tokenPool = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf-8"));
+      const raw = fs.readFileSync(TOKEN_FILE, "utf-8").trim();
+      tokenPool = raw ? JSON.parse(raw) : [];
     }
   } catch (e) {
     console.error("[TokenPool] 加载 token 文件失败:", e);
@@ -104,14 +125,15 @@ let apiKeys: string[] = [];
 
 function loadApiKeys() {
   try {
-    const file = path.join(import.meta.dirname || ".", "apikeys.json");
-    if (fs.existsSync(file)) apiKeys = JSON.parse(fs.readFileSync(file, "utf-8"));
+    if (fs.existsSync(APIKEY_FILE)) {
+      const raw = fs.readFileSync(APIKEY_FILE, "utf-8").trim();
+      apiKeys = raw ? JSON.parse(raw) : [];
+    }
   } catch { apiKeys = []; }
 }
 
 function saveApiKeys() {
-  const file = path.join(import.meta.dirname || ".", "apikeys.json");
-  fs.writeFileSync(file, JSON.stringify(apiKeys, null, 2));
+  fs.writeFileSync(APIKEY_FILE, JSON.stringify(apiKeys, null, 2));
 }
 
 function selectToken(): TokenEntry | null {

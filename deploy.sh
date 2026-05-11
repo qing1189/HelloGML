@@ -41,8 +41,14 @@ compose stop 2>/dev/null || true
 compose rm -f 2>/dev/null || true
 
 echo "[3/5] 构建并启动..."
-mkdir -p data
-touch data/tokens.json data/apikeys.json
+mkdir -p data data/logs
+# 修复历史遗留问题：如果早期部署用的是单文件挂载，tokens.json / apikeys.json 可能被 Docker 创建成了目录
+for f in data/tokens.json data/apikeys.json; do
+  if [ -d "$f" ]; then
+    echo "  检测到 $f 是目录（旧版单文件挂载遗留），正在修复..."
+    rm -rf "$f"
+  fi
+done
 export ADMIN_KEY
 if ! compose up -d --build; then
   echo "[错误] 构建失败"
