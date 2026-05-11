@@ -7,7 +7,9 @@ services:
       - "38412:38412"
     environment:
       - ADMIN_KEY=changeme
+      - DATA_DIR=/app/data
     volumes:
-      - ./data/tokens.json:/app/tokens.json
-      - ./data/apikeys.json:/app/apikeys.json
+      # 目录挂载：避免单文件绑定挂载在宿主机上文件不存在时被 Docker 创建成目录，
+      # 从而导致容器内 fs.writeFileSync('tokens.json') 抛出 EISDIR 错误。
+      - ./data:/app/data
       - ./data/logs:/app/logs
