@@ -1,6 +1,6 @@
 services:
   glm-free-api:
-    image: qingdeng/glm-free-api:v0.0.1
+    image: qingdeng/glm-free-api:v0.0.2
     container_name: glm-free-api
     restart: unless-stopped
     ports:
