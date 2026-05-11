@@ -1,11 +1,9 @@
 /**
  * 独立服务端 —— 可部署在 VPS 上，不依赖 Cloudflare KV
  * - Token 存本地 JSON 文件
- * - Puppeteer 自动获取 chatglm_refresh_token
- * - 定时刷新 token 池
+ * - 手动添加 / 浏览器控制台一键提交 refresh_token（无需浏览器自动化）
  *
  * 运行: npx tsx server.ts
- * 依赖: npm i puppeteer-core
  */
 
 import http from "node:http";
@@ -59,7 +57,6 @@ try {
 }
 const TOKEN_FILE = path.join(DATA_DIR, "tokens.json");
 const APIKEY_FILE = path.join(DATA_DIR, "apikeys.json");
-const CHROME_PATH = process.env.CHROME_PATH || "/usr/bin/google-chrome-stable";
 
 // 防御性检查：如果 tokens.json / apikeys.json 被 Docker 单文件挂载错误地创建成了目录，提前报错并提示修复方法
 for (const f of [TOKEN_FILE, APIKEY_FILE]) {
@@ -178,99 +175,6 @@ async function executeWithRotation<T>(fn: (token: string) => Promise<T>): Promis
   }
 
   throw lastError || new Error("所有 token 都已尝试失败");
-}
-
-// ==================== Puppeteer 自动获取 Token ====================
-
-async function autoFetchToken(): Promise<string | null> {
-  let puppeteer: any;
-  try {
-    puppeteer = await import("puppeteer-core");
-  } catch {
-    console.error("[AutoFetch] puppeteer-core 未安装，跳过自动获取");
-    return null;
-  }
-
-  // 检查浏览器是否存在
-  const browserExists = fs.existsSync(CHROME_PATH);
-  if (!browserExists) {
-    console.error(`[AutoFetch] 浏览器未找到: ${CHROME_PATH}`);
-    console.error("[AutoFetch] Docker 部署: 容器内已内置 Chromium");
-    console.error("[AutoFetch] 裸机部署: apt install chromium 或设置 CHROME_PATH 环境变量");
-    return null;
-  }
-
-  console.error("[AutoFetch] 启动浏览器获取 token...");
-  let browser: any;
-  try {
-    browser = await puppeteer.default.launch({
-      executablePath: CHROME_PATH,
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-      ],
-    });
-
-    const page = await browser.newPage();
-    await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-
-    // 设置合理的超时
-    page.setDefaultTimeout(60000);
-
-    await page.goto("https://chatglm.cn/main/alltoolsdetail", {
-      waitUntil: "networkidle2",
-      timeout: 60000,
-    });
-
-    // 等待 WAF 挑战完成和 cookie 设置
-    await page.waitForFunction(() => {
-      return document.cookie.includes("chatglm_refresh_token");
-    }, { timeout: 30000 }).catch(() => {});
-
-    // 从 cookie 中提取 refresh_token
-    const cookies = await page.cookies();
-    const rtCookie = cookies.find((c: any) => c.name === "chatglm_refresh_token");
-
-    if (rtCookie && rtCookie.value) {
-      console.error(`[AutoFetch] 获取到 token: ${rtCookie.value.slice(0, 16)}...`);
-      return rtCookie.value;
-    }
-
-    console.error("[AutoFetch] 未找到 chatglm_refresh_token cookie");
-    console.error("[AutoFetch] 所有 cookie:", cookies.map((c: any) => c.name).join(", "));
-    return null;
-  } catch (err: any) {
-    console.error("[AutoFetch] 获取失败:", err.message);
-    return null;
-  } finally {
-    if (browser) await browser.close();
-  }
-}
-
-// 定时自动刷新 token 池
-async function autoRefreshLoop() {
-  while (true) {
-    await new Promise((r) => setTimeout(r, 30 * 60 * 1000)); // 每 30 分钟
-    try {
-      const token = await autoFetchToken();
-      if (token) {
-        // 检查是否已存在
-        const exists = tokenPool.some((t) => t.token === token);
-        if (!exists) {
-          addToken(token);
-          console.error("[AutoRefresh] 新 token 已添加到池中");
-        } else {
-          console.error("[AutoRefresh] token 已存在，跳过");
-        }
-      }
-    } catch (err: any) {
-      console.error("[AutoRefresh] 自动刷新失败:", err.message);
-    }
-  }
 }
 
 // ==================== 工具函数 ====================
@@ -428,15 +332,6 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
       const id = addToken(rt);
       jsonResponse(res, { success: true, id, live });
-      return;
-    }
-
-    if (p === "/token/auto-fetch-now" && req.method === "POST") {
-      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized: 需要管理员密钥", 401); return; }
-      const token = await autoFetchToken();
-      if (!token) { errorResponse(res, "自动获取失败，请确认 Chrome 已安装", 500); return; }
-      const id = addToken(token);
-      jsonResponse(res, { success: true, id, preview: token.slice(0, 16) + "..." });
       return;
     }
 
@@ -654,21 +549,9 @@ loadApiKeys();
 console.error(`[Server] Token 池: ${tokenPool.length} 个 token`);
 console.error(`[Server] API Keys: ${apiKeys.length} 个`);
 
-// 首次启动时如果池为空，尝试自动获取
 if (tokenPool.length === 0) {
-  console.error("[Server] Token 池为空，尝试自动获取...");
-  autoFetchToken().then((token) => {
-    if (token) {
-      addToken(token);
-      console.error("[Server] 自动获取成功");
-    } else {
-      console.error("[Server] 自动获取失败，请手动添加 token: http://localhost:" + PORT + "/admin");
-    }
-  });
+  console.error("[Server] Token 池为空，请前往管理面板添加: http://localhost:" + PORT + "/admin");
 }
-
-// 启动定时自动刷新
-autoRefreshLoop();
 
 server.listen(PORT, () => {
   console.error(`[Server] 监听 http://0.0.0.0:${PORT}`);

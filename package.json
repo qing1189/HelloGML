@@ -8,9 +8,7 @@
     "start": "tsx server.ts",
     "server": "tsx server.ts"
   },
-  "dependencies": {
-    "puppeteer-core": "^22.0.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240512.0",
     "tsx": "^4.0.0",
