@@ -49,8 +49,7 @@ for f in data/tokens.json data/apikeys.json; do
     rm -rf "$f"
   fi
 done
-# 确保 ./data 对容器内非 root 用户（uid=1000）可写
-chown -R 1000:1000 data 2>/dev/null || chmod -R 777 data
+# 容器内 entrypoint 会自动 chown data 目录并降权运行，此处无需特殊处理
 export ADMIN_KEY
 if ! compose up -d --build; then
   echo "[错误] 构建失败"

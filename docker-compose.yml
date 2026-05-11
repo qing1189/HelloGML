@@ -9,12 +9,9 @@ services:
       - ADMIN_KEY=changeme
       - DATA_DIR=/app/data
     volumes:
-      # 目录挂载：避免单文件绑定挂载在宿主机上文件不存在时被 Docker 创建成目录，
-      # 从而导致容器内 fs.writeFileSync('tokens.json') 抛出 EISDIR 错误。
+      # 目录挂载：避免单文件绑定挂载在宿主机上文件不存在时被 Docker 创建成目录
+      # entrypoint 脚本会在启动时自动 chown 该目录并降权到 node 用户运行
       - ./data:/app/data
-    # 容器内以 node(uid=1000) 用户运行，宿主机 ./data 目录需让 1000 可写
-    # 如果权限有问题，可改为 root 运行（去掉下面一行），或 chown 1000 ./data
-    user: "1000:1000"
     # 资源限制：限制最大 128MB 内存，避免偶发泄漏影响宿主机
     deploy:
       resources:
