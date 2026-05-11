@@ -5,12 +5,14 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "start": "tsx server.ts",
-    "server": "tsx server.ts"
+    "start": "node dist/server.mjs",
+    "server": "tsx server.ts",
+    "build": "esbuild server.ts --bundle --platform=node --target=node20 --format=esm --minify --legal-comments=none --outfile=dist/server.mjs"
   },
   "dependencies": {},
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240512.0",
+    "esbuild": "^0.23.0",
     "tsx": "^4.0.0",
     "typescript": "^5.4.5",
     "wrangler": "^3.57.0"

@@ -12,4 +12,18 @@ services:
       # 目录挂载：避免单文件绑定挂载在宿主机上文件不存在时被 Docker 创建成目录，
       # 从而导致容器内 fs.writeFileSync('tokens.json') 抛出 EISDIR 错误。
       - ./data:/app/data
-      - ./data/logs:/app/logs
+    # 容器内以 node(uid=1000) 用户运行，宿主机 ./data 目录需让 1000 可写
+    # 如果权限有问题，可改为 root 运行（去掉下面一行），或 chown 1000 ./data
+    user: "1000:1000"
+    # 资源限制：限制最大 128MB 内存，避免偶发泄漏影响宿主机
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    # 健康检查：自动探活
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:38412/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

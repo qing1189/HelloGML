@@ -23,7 +23,8 @@
 - **工具调用** — Function Calling，兼容 OpenAI `tool_calls` 和 Claude `tool_use` 格式，适配 claude-code / open-code
 - **AI 绘图 / 视频生成** — 文生图、文生视频、图生视频
 - **Token 池轮转** — 多 `refresh_token` 组成池子，轮询调度 + 过期自动移除 + 自动切换
-- **双部署模式** — VPS（Node.js，轻量无浏览器依赖）或 Cloudflare Workers（免费，无需服务器）
+- **双部署模式** — VPS（Node.js Alpine Docker 镜像 ~80MB / 运行内存 ~60MB）或 Cloudflare Workers（免费，无需服务器）
+- **极致精简** — 多阶段构建 + esbuild 打包 + tree-shaking，运行时只有一个 ~73 KB 的 JS 文件，无 node_modules
 
 ---
 
@@ -86,11 +87,15 @@ docker compose up -d
 
 ```bash
 cd HelloGML
-npm install
+npm install   # 装开发依赖 (esbuild + tsx)
+npm run build # 用 esbuild 打包为 dist/server.mjs
+npm start     # 运行打包后的 JS（推荐，内存/启动最优）
+
+# 或开发模式直接 tsx 运行
 npm run server
 ```
 
-需自行安装 Node.js 18+ 和 Chrome。后台运行用 systemd：
+需自行安装 Node.js 20+。后台运行用 systemd：
 
 ```ini
 # /etc/systemd/system/glm-free-api.service
@@ -101,11 +106,12 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/path/to/HelloGML
-ExecStart=/usr/bin/npx tsx server.ts
+ExecStart=/usr/bin/node --max-old-space-size=96 /path/to/HelloGML/dist/server.mjs
 Restart=always
 RestartSec=5
 Environment=PORT=38412
 Environment=ADMIN_KEY=your-strong-password
+Environment=DATA_DIR=/path/to/HelloGML/data
 
 [Install]
 WantedBy=multi-user.target
@@ -563,10 +569,19 @@ gemini -m glm5
 
 ## 技术栈
 
-- **运行时** — Cloudflare Workers (V8) / Node.js (VPS)
+- **运行时** — Cloudflare Workers (V8) / Node.js 20+ (Docker Alpine)
 - **语言** — TypeScript
+- **打包** — esbuild（多阶段 Docker 构建，产物 ~73 KB 单文件）
 - **存储** — Cloudflare KV / 本地 `tokens.json`
 - **流式处理** — Web Streams API + SSE 解析器
+
+### 资源占用（参考）
+
+| 场景 | 镜像体积 | 运行时内存（RSS） | 冷启动 |
+|------|---------|-----------------|--------|
+| 当前（Alpine + esbuild bundle） | ~80 MB | ~60 MB | ~180 ms |
+| 裸机（Node 20 + bundle） | — | ~55 MB | ~180 ms |
+| 对比：早期含 Chromium 方案 | ~500 MB | 100-300 MB | 3-5 s |
 
 ---
 

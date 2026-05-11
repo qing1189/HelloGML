@@ -4,3 +4,10 @@ apikeys.json
 .wrangler/
 .dev.vars
 *.log
+
+
+# 构建产物（由 docker 构建时自动生成）
+dist/
+
+# 数据目录（docker-compose 挂载，包含敏感 token）
+data/
