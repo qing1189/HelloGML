@@ -75,7 +75,15 @@ for (const f of [TOKEN_FILE, APIKEY_FILE]) {
 
 setSignSecret(SIGN_SECRET);
 
-// ==================== Token 本地存储 ====================
+// ==================== Token 本地存储 & 智能轮询 ====================
+
+// --- 轮询配置（可通过环境变量覆盖） ---
+const TOKEN_MIN_INTERVAL_MS = parseInt(process.env.TOKEN_MIN_INTERVAL || "3000");  // 同一 token 最小使用间隔（毫秒）
+const TOKEN_RATE_LIMIT_WINDOW = 60_000;  // 频率统计窗口（1 分钟）
+const TOKEN_RATE_LIMIT_MAX = parseInt(process.env.TOKEN_RATE_LIMIT || "20");  // 每个 token 每分钟最大请求数
+const TOKEN_COOLDOWN_BASE_MS = 10_000;  // 失败后冷却基础时长（毫秒）
+const TOKEN_MAX_FAIL_COUNT = 5;  // 最大连续失败次数，超过后标记为不可用
+const GLOBAL_QPS_LIMIT = parseInt(process.env.GLOBAL_QPS || "10");  // 全局每秒最大并发请求数
 
 interface TokenEntry {
   id: string;
@@ -83,6 +91,9 @@ interface TokenEntry {
   addedAt: number;
   lastUsed: number;
   failCount: number;
+  // 以下字段仅运行时使用，不持久化
+  requestTimestamps?: number[];  // 最近 1 分钟内的请求时间戳
+  cooldownUntil?: number;  // 冷却到期时间
 }
 
 let tokenPool: TokenEntry[] = [];
@@ -92,6 +103,11 @@ function loadTokens() {
     if (fs.existsSync(TOKEN_FILE)) {
       const raw = fs.readFileSync(TOKEN_FILE, "utf-8").trim();
       tokenPool = raw ? JSON.parse(raw) : [];
+      // 恢复运行时字段
+      for (const t of tokenPool) {
+        t.requestTimestamps = [];
+        t.cooldownUntil = 0;
+      }
     }
   } catch (e) {
     console.error("[TokenPool] 加载 token 文件失败:", e);
@@ -100,12 +116,16 @@ function loadTokens() {
 }
 
 function saveTokens() {
-  fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenPool, null, 2));
+  // 持久化时排除运行时字段
+  const data = tokenPool.map(({ id, token, addedAt, lastUsed, failCount }) => ({
+    id, token, addedAt, lastUsed, failCount
+  }));
+  fs.writeFileSync(TOKEN_FILE, JSON.stringify(data, null, 2));
 }
 
 function addToken(token: string): string {
   const id = `tk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  tokenPool.push({ id, token, addedAt: Date.now(), lastUsed: 0, failCount: 0 });
+  tokenPool.push({ id, token, addedAt: Date.now(), lastUsed: 0, failCount: 0, requestTimestamps: [], cooldownUntil: 0 });
   saveTokens();
   console.error(`[TokenPool] 添加 token: ${id}`);
   return id;
@@ -117,7 +137,64 @@ function removeToken(id: string) {
   console.error(`[TokenPool] 移除 token: ${id}`);
 }
 
-let roundRobinIdx = 0;
+// --- 智能选择：最久未用 + 间隔保护 + 频率窗口 + 冷却退避 ---
+
+function isTokenAvailable(entry: TokenEntry, now: number): boolean {
+  // 1. 失败次数超限
+  if (entry.failCount >= TOKEN_MAX_FAIL_COUNT) return false;
+
+  // 2. 正在冷却中（失败后指数退避）
+  if (entry.cooldownUntil && now < entry.cooldownUntil) return false;
+
+  // 3. 最小使用间隔保护（同一 token 不能太频繁）
+  if (entry.lastUsed && (now - entry.lastUsed) < TOKEN_MIN_INTERVAL_MS) return false;
+
+  // 4. 频率窗口限制（1 分钟内不超过 N 次）
+  const timestamps = entry.requestTimestamps || [];
+  const windowStart = now - TOKEN_RATE_LIMIT_WINDOW;
+  const recentCount = timestamps.filter(t => t > windowStart).length;
+  if (recentCount >= TOKEN_RATE_LIMIT_MAX) return false;
+
+  return true;
+}
+
+function selectToken(): TokenEntry | null {
+  const now = Date.now();
+  // 筛选可用的 token
+  const available = tokenPool.filter(t => isTokenAvailable(t, now));
+
+  if (available.length === 0) return null;
+
+  // 最久未使用优先（LRU）
+  available.sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0));
+  return available[0];
+}
+
+// --- 全局 QPS 限流器（令牌桶） ---
+
+let globalTokenBucket = GLOBAL_QPS_LIMIT;
+let lastBucketRefill = Date.now();
+
+function acquireGlobalSlot(): boolean {
+  const now = Date.now();
+  const elapsed = now - lastBucketRefill;
+  // 每秒补充 GLOBAL_QPS_LIMIT 个令牌
+  if (elapsed >= 1000) {
+    globalTokenBucket = Math.min(GLOBAL_QPS_LIMIT, globalTokenBucket + Math.floor(elapsed / 1000) * GLOBAL_QPS_LIMIT);
+    lastBucketRefill = now;
+  }
+  if (globalTokenBucket > 0) {
+    globalTokenBucket--;
+    return true;
+  }
+  return false;
+}
+
+async function waitForGlobalSlot(): Promise<void> {
+  while (!acquireGlobalSlot()) {
+    await new Promise(r => setTimeout(r, 100)); // 每 100ms 重试
+  }
+}
 
 // ==================== API Key 存储 ====================
 
@@ -136,32 +213,37 @@ function saveApiKeys() {
   fs.writeFileSync(APIKEY_FILE, JSON.stringify(apiKeys, null, 2));
 }
 
-function selectToken(): TokenEntry | null {
-  const active = tokenPool.filter((t) => t.failCount < 3);
-  if (active.length === 0) return null;
-  const idx = roundRobinIdx % active.length;
-  roundRobinIdx++;
-  return active[idx];
-}
-
-// ==================== 带轮转的请求执行器 ====================
+// ==================== 带智能轮转的请求执行器 ====================
 
 async function executeWithRotation<T>(fn: (token: string) => Promise<T>): Promise<T> {
-  const active = tokenPool.filter((t) => t.failCount < 3);
-  if (active.length === 0) throw new Error("没有可用的 refresh_token，请先添加");
+  // 全局限流：等待拿到令牌
+  await waitForGlobalSlot();
 
-  let lastError: Error | null = null;
+  const now = Date.now();
   const tried = new Set<string>();
+  let lastError: Error | null = null;
 
-  for (let i = 0; i < active.length; i++) {
+  // 最多尝试池中所有 token
+  for (let i = 0; i < tokenPool.length; i++) {
     const entry = selectToken();
-    if (!entry || tried.has(entry.token)) continue;
-    tried.add(entry.token);
+    if (!entry) break;
+    if (tried.has(entry.id)) break;
+    tried.add(entry.id);
 
     try {
-      const result = await fn(entry.token);
-      entry.failCount = 0;
+      // 记录使用时间和频率
       entry.lastUsed = Date.now();
+      if (!entry.requestTimestamps) entry.requestTimestamps = [];
+      entry.requestTimestamps.push(Date.now());
+      // 清理过期时间戳（只保留 1 分钟内的）
+      const windowStart = Date.now() - TOKEN_RATE_LIMIT_WINDOW;
+      entry.requestTimestamps = entry.requestTimestamps.filter(t => t > windowStart);
+
+      const result = await fn(entry.token);
+
+      // 成功：重置失败计数和冷却
+      entry.failCount = 0;
+      entry.cooldownUntil = 0;
       saveTokens();
       return result;
     } catch (err: any) {
@@ -169,15 +251,34 @@ async function executeWithRotation<T>(fn: (token: string) => Promise<T>): Promis
       if (err instanceof TokenExpiredError) {
         console.error(`[TokenPool] Token ${entry.id} 过期，移除`);
         removeToken(entry.id);
-        continue;
+        continue;  // 尝试下一个
       }
+      // 非过期错误：增加失败计数 + 设置指数退避冷却
       entry.failCount++;
+      entry.cooldownUntil = Date.now() + TOKEN_COOLDOWN_BASE_MS * Math.pow(2, entry.failCount - 1);
+      console.error(`[TokenPool] Token ${entry.id} 失败 (${entry.failCount}次)，冷却 ${Math.round((entry.cooldownUntil - Date.now()) / 1000)}s`);
       saveTokens();
-      throw err;
+      continue;  // 尝试下一个（之前是直接 throw，现在改为继续轮转）
     }
   }
 
-  throw lastError || new Error("所有 token 都已尝试失败");
+  // 所有 token 都试过了
+  if (tokenPool.length > 0 && !selectToken()) {
+    // 可能全部在冷却中，找出最快解冻的等一下
+    const soonest = tokenPool
+      .filter(t => t.failCount < TOKEN_MAX_FAIL_COUNT && t.cooldownUntil)
+      .sort((a, b) => (a.cooldownUntil || 0) - (b.cooldownUntil || 0))[0];
+    if (soonest && soonest.cooldownUntil) {
+      const waitMs = Math.min(soonest.cooldownUntil - Date.now(), 30_000); // 最多等 30 秒
+      if (waitMs > 0) {
+        console.error(`[TokenPool] 所有 token 冷却中，等待 ${Math.round(waitMs / 1000)}s 后重试...`);
+        await new Promise(r => setTimeout(r, waitMs));
+        return executeWithRotation(fn);  // 递归重试一次
+      }
+    }
+  }
+
+  throw lastError || new Error("没有可用的 refresh_token，请先添加");
 }
 
 // ==================== Puppeteer 自动获取 Token ====================
