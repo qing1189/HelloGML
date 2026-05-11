@@ -42,6 +42,12 @@ import {
   createGeminiCompletion,
 } from "./src/adapters.ts";
 import { getAdminPanelHTML } from "./src/admin-panel.ts";
+import {
+  initStats, recordUsage, estimateInputTokens, estimateTokens,
+  getTokenStats, getApiKeyStats, listAllTokenStats, listAllApiKeyStats,
+  removeTokenStats, removeApiKeyStats, resetAllStats, getSummary,
+  flushStats,
+} from "./src/stats.ts";
 
 // ==================== 配置 ====================
 
@@ -57,6 +63,9 @@ try {
 }
 const TOKEN_FILE = path.join(DATA_DIR, "tokens.json");
 const APIKEY_FILE = path.join(DATA_DIR, "apikeys.json");
+
+// 初始化用量统计模块（stats.json 存在同一数据目录）
+initStats(DATA_DIR);
 
 // 防御性检查：如果 tokens.json / apikeys.json 被 Docker 单文件挂载错误地创建成了目录，提前报错并提示修复方法
 for (const f of [TOKEN_FILE, APIKEY_FILE]) {
@@ -131,6 +140,7 @@ function addToken(token: string): string {
 function removeToken(id: string) {
   tokenPool = tokenPool.filter((t) => t.id !== id);
   saveTokens();
+  removeTokenStats(id);
   console.error(`[TokenPool] 移除 token: ${id}`);
 }
 
@@ -210,7 +220,14 @@ async function waitForGlobalSlot(): Promise<void> {
 
 // ==================== 带智能轮转的请求执行器 ====================
 
-async function executeWithRotation<T>(fn: (token: string) => Promise<T>): Promise<T> {
+// 统计上下文：调用方传入，执行器回填 tokenId 用于流式增量记账
+interface UsageCtx {
+  apiKey?: string;       // 发起请求的 api key（未配置则为 "anonymous"）
+  inputTokens?: number;  // 预估的输入 token 数
+  tokenId?: string;      // 由执行器回填：实际被选中的 refresh_token id
+}
+
+async function executeWithRotation<T>(fn: (token: string) => Promise<T>, ctx?: UsageCtx): Promise<T> {
   // 全局限流：等待拿到令牌
   await waitForGlobalSlot();
 
@@ -233,12 +250,26 @@ async function executeWithRotation<T>(fn: (token: string) => Promise<T>): Promis
       const windowStart = Date.now() - TOKEN_RATE_LIMIT_WINDOW;
       entry.requestTimestamps = entry.requestTimestamps.filter(t => t > windowStart);
 
+      if (ctx) ctx.tokenId = entry.id;
       const result = await fn(entry.token);
 
       // 成功：重置失败计数和冷却
       entry.failCount = 0;
       entry.cooldownUntil = 0;
       saveTokens();
+      // 成功统计：非流式场景在调用方记账 output_tokens；流式场景由 wrapStreamForUsage 记账
+      // 这里先记录一次"请求成功"（输入 token 已知，输出未知由后续补）
+      if (ctx && !(result instanceof ReadableStream)) {
+        // 非流式：从结果里取 usage（如果适配层填了估算值），否则只记输入
+        const usage = (result as any)?.usage || {};
+        recordUsage({
+          tokenId: entry.id,
+          apiKey: ctx.apiKey,
+          inputTokens: ctx.inputTokens,
+          outputTokens: estimateNonStreamOutput(result),
+          success: true,
+        });
+      }
       return result;
     } catch (err: any) {
       lastError = err;
@@ -266,12 +297,130 @@ async function executeWithRotation<T>(fn: (token: string) => Promise<T>): Promis
       if (waitMs > 0) {
         console.error(`[TokenPool] 所有 token 冷却中，等待 ${Math.round(waitMs / 1000)}s 后重试...`);
         await new Promise(r => setTimeout(r, waitMs));
-        return executeWithRotation(fn);  // 递归重试一次
+        return executeWithRotation(fn, ctx);  // 递归重试一次
       }
     }
   }
 
+  // 彻底失败：也记一次
+  if (ctx) {
+    recordUsage({
+      tokenId: ctx.tokenId,
+      apiKey: ctx.apiKey,
+      inputTokens: ctx.inputTokens,
+      outputTokens: 0,
+      success: false,
+    });
+  }
+
   throw lastError || new Error("没有可用的 refresh_token，请先添加");
+}
+
+// 非流式响应的输出 token 估算（兼容 OpenAI / Claude / Gemini 三种返回结构）
+function estimateNonStreamOutput(result: any): number {
+  if (!result || typeof result !== "object") return 0;
+  // OpenAI: choices[].message.content
+  if (Array.isArray(result.choices)) {
+    let t = 0;
+    for (const c of result.choices) {
+      const content = c?.message?.content;
+      if (typeof content === "string") t += estimateTokens(content);
+      else if (Array.isArray(content)) {
+        for (const p of content) if (typeof p?.text === "string") t += estimateTokens(p.text);
+      }
+      // tool_calls 也算
+      const tc = c?.message?.tool_calls;
+      if (Array.isArray(tc)) for (const call of tc) t += estimateTokens(JSON.stringify(call));
+    }
+    return t;
+  }
+  // Claude: content[].text 或 .type=="text"
+  if (Array.isArray(result.content)) {
+    let t = 0;
+    for (const p of result.content) {
+      if (typeof p?.text === "string") t += estimateTokens(p.text);
+      else if (p?.type === "tool_use" && p.input) t += estimateTokens(JSON.stringify(p.input));
+    }
+    return t;
+  }
+  // Gemini: candidates[].content.parts[].text
+  if (Array.isArray(result.candidates)) {
+    let t = 0;
+    for (const c of result.candidates) {
+      const parts = c?.content?.parts;
+      if (Array.isArray(parts)) for (const p of parts) if (typeof p?.text === "string") t += estimateTokens(p.text);
+    }
+    return t;
+  }
+  return 0;
+}
+
+// 包装流式响应，实时累加输出 token，结束时记一次用量
+function wrapStreamForUsage(stream: ReadableStream, ctx: UsageCtx): ReadableStream {
+  const decoder = new TextDecoder();
+  let outputChars = "";  // 累加用于估算的文本
+  let recorded = false;
+
+  const recordOnce = (success: boolean) => {
+    if (recorded) return;
+    recorded = true;
+    recordUsage({
+      tokenId: ctx.tokenId,
+      apiKey: ctx.apiKey,
+      inputTokens: ctx.inputTokens,
+      outputTokens: estimateTokens(outputChars),
+      success,
+    });
+  };
+
+  return new ReadableStream({
+    async start(controller) {
+      const reader = stream.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          // 从 SSE 数据帧里解析出 delta 文本用于估算
+          if (value) {
+            const text = decoder.decode(value, { stream: true });
+            extractDeltaText(text, (delta) => { outputChars += delta; });
+            controller.enqueue(value);
+          }
+        }
+        recordOnce(true);
+        controller.close();
+      } catch (err) {
+        recordOnce(false);
+        controller.error(err);
+      } finally {
+        reader.releaseLock();
+      }
+    },
+    cancel() { recordOnce(true); }
+  });
+}
+
+// 从 SSE 流文本中抽取 delta 内容（增量文本），兼容 OpenAI / Claude / Gemini 三种格式
+function extractDeltaText(chunk: string, push: (s: string) => void) {
+  // 按行分割
+  const lines = chunk.split("\n");
+  for (const line of lines) {
+    if (!line.startsWith("data: ")) continue;
+    const payload = line.slice(6).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const j = JSON.parse(payload);
+      // OpenAI chunk: choices[].delta.content
+      const oa = j?.choices?.[0]?.delta?.content;
+      if (typeof oa === "string") { push(oa); continue; }
+      // Claude: content_block_delta { delta: { type:"text_delta", text } }
+      const cl = j?.delta?.text;
+      if (typeof cl === "string") { push(cl); continue; }
+      // Gemini: candidates[].content.parts[].text
+      const gm = j?.candidates?.[0]?.content?.parts;
+      if (Array.isArray(gm)) { for (const p of gm) if (typeof p?.text === "string") push(p.text); continue; }
+    } catch { /* 非 JSON 心跳之类，忽略 */ }
+  }
 }
 
 // ==================== 工具函数 ====================
@@ -379,6 +528,15 @@ function checkAdmin(req: http.IncomingMessage): boolean {
   return key === ADMIN_KEY;
 }
 
+// 获取发起请求的 api_key 标识（用于统计）
+function getCallerApiKey(req: http.IncomingMessage): string {
+  const keys = extractAPIKeys(req);
+  if (keys.length === 0) return "anonymous";
+  // 优先返回配置列表里的 key；否则返回客户端传的第一个
+  const matched = keys.find(k => apiKeys.includes(k));
+  return matched || keys[0] || "anonymous";
+}
+
 // ==================== 路由处理 ====================
 
 const SUPPORTED_MODELS = [
@@ -449,7 +607,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         return;
       }
       if (req.method === "GET") {
-        jsonResponse(res, { keys: apiKeys.map((k) => ({ api_key: k })) });
+        jsonResponse(res, {
+          keys: apiKeys.map((k) => {
+            const s = getApiKeyStats(k);
+            return {
+              api_key: k,
+              total_requests: s?.total.requests || 0,
+              total_input_tokens: s?.total.input_tokens || 0,
+              total_output_tokens: s?.total.output_tokens || 0,
+              last_used: s?.last_used || 0,
+            };
+          })
+        });
         return;
       }
       if (req.method === "DELETE") {
@@ -457,6 +626,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (!body.api_key) { errorResponse(res, "Missing api_key"); return; }
         apiKeys = apiKeys.filter((k) => k !== body.api_key);
         saveApiKeys();
+        if (body.purge_stats) removeApiKeyStats(body.api_key);
         jsonResponse(res, { success: true, message: "API key deleted" });
         return;
       }
@@ -475,11 +645,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       }
       if (req.method === "GET") {
         jsonResponse(res, {
-          tokens: tokenPool.map((t) => ({
-            id: t.id,
-            token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4),
-            failCount: t.failCount,
-          })),
+          tokens: tokenPool.map((t) => {
+            const s = getTokenStats(t.id);
+            return {
+              id: t.id,
+              token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4),
+              failCount: t.failCount,
+              last_used: t.lastUsed || 0,
+              total_requests: s?.total.requests || 0,
+              total_input_tokens: s?.total.input_tokens || 0,
+              total_output_tokens: s?.total.output_tokens || 0,
+            };
+          }),
         });
         return;
       }
@@ -503,6 +680,91 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       return;
     }
 
+    // ===== 用量统计（需要 Admin Key）=====
+    // 查总览：/admin/stats
+    if (p === "/admin/stats" && req.method === "GET") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      jsonResponse(res, { summary: getSummary() });
+      return;
+    }
+
+    // 按 token 维度查询
+    // - GET /admin/stats/tokens          列出所有 token 的统计
+    // - GET /admin/stats/tokens?id=tk_x  查询单个 token 详情（含每日明细）
+    if (p === "/admin/stats/tokens" && req.method === "GET") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      const id = url.searchParams.get("id");
+      if (id) {
+        const s = getTokenStats(id);
+        if (!s) { errorResponse(res, "Token stats not found", 404); return; }
+        const entry = tokenPool.find(t => t.id === id);
+        jsonResponse(res, {
+          id,
+          token_preview: entry ? entry.token.slice(0, 8) + "****" + entry.token.slice(-4) : null,
+          total: s.total,
+          daily: s.daily,
+          last_used: s.last_used || 0,
+        });
+        return;
+      }
+      // 列表：合并池子里当前存在的 token 和历史统计
+      const all = listAllTokenStats();
+      const list = tokenPool.map(t => {
+        const s = all[t.id];
+        return {
+          id: t.id,
+          token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4),
+          in_pool: true,
+          total: s?.total || { requests: 0, success: 0, fail: 0, input_tokens: 0, output_tokens: 0 },
+          last_used: s?.last_used || t.lastUsed || 0,
+        };
+      });
+      // 再带上已不在池中但有历史统计的
+      for (const [id, s] of Object.entries(all)) {
+        if (!tokenPool.find(t => t.id === id)) {
+          list.push({ id, token_preview: "(已移除)", in_pool: false, total: s.total, last_used: s.last_used || 0 } as any);
+        }
+      }
+      jsonResponse(res, { tokens: list });
+      return;
+    }
+
+    // 按 api_key 维度查询
+    // - GET /admin/stats/apikeys          列表
+    // - GET /admin/stats/apikeys?key=xxx  详情
+    if (p === "/admin/stats/apikeys" && req.method === "GET") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      const key = url.searchParams.get("key");
+      if (key) {
+        const s = getApiKeyStats(key);
+        if (!s) { errorResponse(res, "API key stats not found", 404); return; }
+        jsonResponse(res, {
+          api_key: key,
+          total: s.total,
+          daily: s.daily,
+          last_used: s.last_used || 0,
+        });
+        return;
+      }
+      const all = listAllApiKeyStats();
+      const list = Object.entries(all).map(([k, s]) => ({
+        api_key: k,
+        configured: apiKeys.includes(k),
+        total: s.total,
+        last_used: s.last_used || 0,
+      }));
+      jsonResponse(res, { apikeys: list });
+      return;
+    }
+
+    // 重置所有统计
+    if (p === "/admin/stats/reset" && req.method === "POST") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      resetAllStats();
+      jsonResponse(res, { success: true, message: "统计数据已重置" });
+      return;
+    }
+
     // ===== API 接口（需要认证） =====
     if (!checkAuth(req)) {
       errorResponse(res, "Unauthorized: invalid or missing API key", 401);
@@ -514,16 +776,16 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       if (!Array.isArray(body.messages)) { errorResponse(res, "messages must be an array"); return; }
 
       const { model, conversation_id: convId, messages, stream, tools } = body;
+      const ctx: UsageCtx = { apiKey: getCallerApiKey(req), inputTokens: estimateInputTokens(messages) };
 
       if (stream) {
-        // 立即发送 SSE 头，不等待 GLM 响应
         const glmStreamPromise = executeWithRotation((rt) =>
-          createCompletionStream(messages, rt, model, convId, 0, tools)
-        );
+          createCompletionStream(messages, rt, model, convId, 0, tools), ctx
+        ).then((s) => wrapStreamForUsage(s, ctx));
         sseResponse(res, glmStreamPromise);
       } else {
         const result = await executeWithRotation((rt) =>
-          createCompletion(messages, rt, model, convId, 0, tools)
+          createCompletion(messages, rt, model, convId, 0, tools), ctx
         );
         jsonResponse(res, result);
       }
@@ -535,19 +797,21 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       if (!Array.isArray(body.messages)) { errorResponse(res, "messages must be an array"); return; }
 
       const { model, messages, system, stream, conversation_id: convId, tools } = body;
+      // Claude 格式的 system 可能在顶层，messages 本身也要估
+      const inputTokens = estimateInputTokens(messages) + (typeof system === "string" ? estimateTokens(system) : 0);
+      const ctx: UsageCtx = { apiKey: getCallerApiKey(req), inputTokens };
 
       if (stream) {
-        // 立即发送 SSE 头，不等待 GLM 响应
         const claudeStreamPromise = executeWithRotation((rt) =>
-          createClaudeCompletion(model, messages, system, rt, true, convId, tools)
+          createClaudeCompletion(model, messages, system, rt, true, convId, tools), ctx
         ).then((result) => {
-          if (result instanceof ReadableStream) return result;
+          if (result instanceof ReadableStream) return wrapStreamForUsage(result, ctx);
           throw new Error("Expected stream but got non-stream response");
         });
         sseResponse(res, claudeStreamPromise);
       } else {
         const result = await executeWithRotation((rt) =>
-          createClaudeCompletion(model, messages, system, rt, false, convId, tools)
+          createClaudeCompletion(model, messages, system, rt, false, convId, tools), ctx
         );
         jsonResponse(res, result);
       }
@@ -565,8 +829,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const modelName = p.split("/").pop()?.replace(":generateContent", "") || "";
       const contents = body.contents || [];
       const systemInstruction = body.systemInstruction;
+      // Gemini 的 contents 结构与 messages 不同，做一个简易估算
+      const flat = Array.isArray(contents) ? contents.flatMap((c: any) =>
+        Array.isArray(c?.parts) ? c.parts.map((p: any) => ({ content: p?.text || "" })) : []
+      ) : [];
+      const ctx: UsageCtx = { apiKey: getCallerApiKey(req), inputTokens: estimateInputTokens(flat) };
       const result = await executeWithRotation((rt) =>
-        createGeminiCompletion(modelName, contents, systemInstruction, rt, false)
+        createGeminiCompletion(modelName, contents, systemInstruction, rt, false), ctx
       );
       jsonResponse(res, result);
       return;
@@ -577,9 +846,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const modelName = p.split("/").pop()?.replace(":streamGenerateContent", "") || "";
       const contents = body.contents || [];
       const systemInstruction = body.systemInstruction;
+      const flat = Array.isArray(contents) ? contents.flatMap((c: any) =>
+        Array.isArray(c?.parts) ? c.parts.map((p: any) => ({ content: p?.text || "" })) : []
+      ) : [];
+      const ctx: UsageCtx = { apiKey: getCallerApiKey(req), inputTokens: estimateInputTokens(flat) };
       const glmStreamPromise = executeWithRotation((rt) =>
-        createGeminiCompletion(modelName, contents, systemInstruction, rt, true)
-      );
+        createGeminiCompletion(modelName, contents, systemInstruction, rt, true), ctx
+      ).then((s) => wrapStreamForUsage(s as ReadableStream, ctx));
       sseResponse(res, glmStreamPromise);
       return;
     }
@@ -589,8 +862,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const body = await readBody(req);
       const { model, prompt, response_format } = body;
       if (!prompt) { errorResponse(res, "Missing prompt"); return; }
+      const ctx: UsageCtx = { apiKey: getCallerApiKey(req), inputTokens: estimateTokens(prompt) };
       const urls = await executeWithRotation((rt) =>
-        generateImages(model, prompt, rt)
+        generateImages(model, prompt, rt), ctx
       );
       const images = urls.map((url: string) =>
         response_format === "b64_json" ? { b64_json: url } : { url }
@@ -604,6 +878,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       const body = await readBody(req);
       const { model, prompt, video_style, emotional_atmosphere, mirror_mode, image_url, audio_id, conversation_id: convId } = body;
       if (!prompt) { errorResponse(res, "Missing prompt"); return; }
+      const ctx: UsageCtx = { apiKey: getCallerApiKey(req), inputTokens: estimateTokens(prompt) };
       const result = await executeWithRotation((rt) =>
         generateVideos(model, prompt, rt, {
           imageUrl: image_url || "",
@@ -611,7 +886,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
           emotionalAtmosphere: emotional_atmosphere || "",
           mirrorMode: mirror_mode || "",
           audioId: audio_id || "",
-        }, convId)
+        }, convId), ctx
       );
       jsonResponse(res, { data: result });
       return;
@@ -655,3 +930,6 @@ server.listen(PORT, () => {
   console.error(`[Server] 管理面板: http://localhost:${PORT}/admin`);
   console.error(`[Server] API: http://localhost:${PORT}/v1/chat/completions`);
 });
+
+// 进程退出前刷盘统计数据
+process.on("exit", () => flushStats());
