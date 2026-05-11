@@ -457,15 +457,6 @@ export default {
         response = await handleTokenCheck(request, env);
       } else if (path === "/token/auto-fetch" && request.method === "POST") {
         response = await handleAutoFetchToken(request, env);
-      } else if (path === "/token/auto-fetch-now" && request.method === "POST") {
-        // 自动获取 Token（需要 Admin Key）
-        const adminKey = request.headers.get("X-Admin-Key") || "";
-        if (env.ADMIN_KEY && adminKey !== env.ADMIN_KEY) {
-          response = errorResponse("Unauthorized: invalid admin key", 401);
-        } else {
-          // CF Worker 不支持 Puppeteer，返回提示
-          response = errorResponse("自动获取功能仅支持 VPS/Docker 部署，请手动添加 Token", 400);
-        }
       } else if (path === "/admin/apikey") {
         response = await handleAdminAPIKey(request, env);
       } else if (path === "/admin/token") {

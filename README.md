@@ -23,7 +23,7 @@
 - **工具调用** — Function Calling，兼容 OpenAI `tool_calls` 和 Claude `tool_use` 格式，适配 claude-code / open-code
 - **AI 绘图 / 视频生成** — 文生图、文生视频、图生视频
 - **Token 池轮转** — 多 `refresh_token` 组成池子，轮询调度 + 过期自动移除 + 自动切换
-- **双部署模式** — VPS（Node.js + Puppeteer 全自动）或 Cloudflare Workers（免费，无需服务器）
+- **双部署模式** — VPS（Node.js，轻量无浏览器依赖）或 Cloudflare Workers（免费，无需服务器）
 
 ---
 
@@ -66,17 +66,15 @@ docker compose up -d
 ```
 
 服务启动后：
-1. 自动检测容器内 `tokens.json` 是否有可用 Token
-2. 若为空，自动通过 Chromium 访问 chatglm.cn 获取 `chatglm_refresh_token`
-3. 每 30 分钟自动刷新 Token 池
-4. 访问 `http://your-server:38412/token/fetch-helper` 管理页面添加/查看 Token
+1. 自动读取容器内 `/app/data/tokens.json` 中的 Token（通过 `./data` 目录挂载持久化）
+2. 访问 `http://your-server:38412/admin` 或 `/token/fetch-helper` 管理页面添加/查看 Token
 
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PORT` | `38412` | 监听端口 |
-| `CHROME_PATH` | `/usr/bin/chromium` | Chrome 路径（容器内已内置） |
+| `DATA_DIR` | `/app/data` (Docker) / 脚本目录 (裸机) | `tokens.json` 和 `apikeys.json` 存放目录 |
 | `SIGN_SECRET` | `8a1317a7468aa3ad86e997d08f3f31cb` | 签名密钥 |
 | `ADMIN_KEY` | `changeme` | 管理员密钥，用于管理面板登录和所有 `/admin/*`、`/token/*` 接口的鉴权 |
 
@@ -178,11 +176,7 @@ npx wrangler dev --local
 2. F12 → Application → Cookies
 3. 复制 `chatglm_refresh_token` 的值
 
-**方式二：VPS 自动获取**
-
-安装 Chrome 后，服务启动时自动通过 Puppeteer 获取。也可在管理页面点击「自动获取」按钮。
-
-**方式三：浏览器控制台一键提交**
+**方式二：浏览器控制台一键提交**
 
 在 chatglm.cn 页面 F12 控制台运行（地址替换为你的服务地址）：
 
@@ -197,7 +191,7 @@ fetch("http://your-server:38412/token/auto-fetch",{method:"POST",headers:{"Conte
 | 地址 | 说明 |
 |------|------|
 | `http://your-server:38412/admin` | **完整管理面板** — API Key 管理、Token 池管理、Token 有效性检测 |
-| `http://your-server:38412/token/fetch-helper` | **简易 Token 管理** — 手动添加、一键提取、自动获取 |
+| `http://your-server:38412/token/fetch-helper` | **简易 Token 管理** — 手动添加、一键提取 |
 | `http://your-server:38412/` | 首页，显示 Token 池状态和链接 |
 
 **管理面板登录**：首次访问管理面板需要输入 `ADMIN_KEY`（默认 `changeme`），输入后自动保存到浏览器。所有管理操作（添加/删除 Token、管理 API Key）都需要此密钥。API 调用接口则使用独立的 API Key 认证。
@@ -211,7 +205,6 @@ fetch("http://your-server:38412/token/auto-fetch",{method:"POST",headers:{"Conte
 **简易 Token 管理页面**（`/token/fetch-helper`）提供更直观的 Token 获取引导：
 - 手动粘贴添加（推荐）
 - 浏览器控制台一键提取脚本（推荐）
-- 自动获取（Docker 环境，容器内已内置 Chromium）
 
 ### API Key 管理
 
@@ -261,9 +254,6 @@ curl -X POST http://your-server:38412/admin/token/check \
   -H "Content-Type: application/json" \
   -H "X-Admin-Key: your-admin-key" \
   -d '{"id":"tk_xxx"}'
-
-# 立即自动获取
-curl -X POST http://your-server:38412/token/auto-fetch-now
 ```
 
 ### Token 轮转机制
@@ -576,7 +566,6 @@ gemini -m glm5
 - **运行时** — Cloudflare Workers (V8) / Node.js (VPS)
 - **语言** — TypeScript
 - **存储** — Cloudflare KV / 本地 `tokens.json`
-- **自动化** — Puppeteer-core（VPS 自动获取 Token）
 - **流式处理** — Web Streams API + SSE 解析器
 
 ---

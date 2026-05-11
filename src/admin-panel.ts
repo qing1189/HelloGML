@@ -521,13 +521,6 @@ export function getAdminPanelHTML(): string {
     </div>
 
     <div class="card">
-      <div class="card-title">自动获取 <span class="badge" style="background:var(--gold-light);color:var(--ink);font-size:0.7rem;padding:2px 8px;margin-left:6px;">Docker/VPS</span></div>
-      <p style="color:var(--ink-faint);font-size:0.85rem;margin-bottom:1rem;">需要服务器安装 Chromium（Docker 镜像已内置）。点击按钮自动从 chatglm.cn 获取 refresh_token。裸机部署需先安装：<code>apt install chromium</code></p>
-      <button class="btn btn-primary" onclick="autoFetchToken()">自动获取</button>
-      <div id="autoFetchStatus" style="display:none;margin-top:0.6rem;padding:0.6rem;border-radius:6px;font-size:0.85rem;"></div>
-    </div>
-
-    <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem;">
         <div class="card-title" style="margin:0;border:none;padding:0;">Token 池列表</div>
         <button class="btn btn-secondary btn-sm" onclick="loadTokens()">刷新列表</button>
@@ -879,7 +872,7 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
     $('newRefreshToken').value = '';
   };
 
-  // ==================== 浏览器提取 & 自动获取 ====================
+  // ==================== 浏览器控制台提取脚本 ====================
 
   function updateSnippetUrl() {
     const base = getBaseUrl();
@@ -894,33 +887,6 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
     }).catch(function() {
       showToast('复制失败，请手动复制', 'error');
     });
-  };
-
-  window.autoFetchToken = async function() {
-    const statusEl = $('autoFetchStatus');
-    statusEl.style.display = 'block';
-    statusEl.style.background = 'var(--parchment-dark)';
-    statusEl.style.color = 'var(--ink)';
-    statusEl.textContent = '正在获取 Token...';
-
-    try {
-      const data = await api('/token/auto-fetch-now', { method: 'POST' });
-      if (data.success) {
-        statusEl.style.background = 'rgba(90,125,74,0.15)';
-        statusEl.style.color = 'var(--green)';
-        statusEl.textContent = '获取成功! Token ID: ' + data.id;
-        loadTokens();
-        loadDashboard();
-      } else {
-        statusEl.style.background = 'rgba(139,58,58,0.15)';
-        statusEl.style.color = 'var(--crimson)';
-        statusEl.textContent = '获取失败: ' + (data.message || '未知错误');
-      }
-    } catch (e) {
-      statusEl.style.background = 'rgba(139,58,58,0.15)';
-      statusEl.style.color = 'var(--crimson)';
-      statusEl.textContent = '获取失败: ' + e.message;
-    }
   };
 
   function maskKey(key) {
