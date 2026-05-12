@@ -422,6 +422,7 @@ export function getAdminPanelHTML(): string {
     <button class="nav-item active" onclick="showSection('dashboard')">概览</button>
     <button class="nav-item" onclick="showSection('apikeys')">API Key</button>
     <button class="nav-item" onclick="showSection('tokens')">Token 池</button>
+    <button class="nav-item" onclick="showSection('usage')">用量统计</button>
     <button class="nav-item" onclick="showSection('guide')">使用指南</button>
   </div>
 
@@ -442,13 +443,30 @@ export function getAdminPanelHTML(): string {
       </div>
     </div>
 
+    <div class="stats-grid">
+      <div class="stat-item">
+        <div class="stat-value" id="statTotalRequests">-</div>
+        <div class="stat-label">累计请求数</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-value" id="statTotalInputTokens">-</div>
+        <div class="stat-label">累计输入 Token</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-value" id="statTotalOutputTokens">-</div>
+        <div class="stat-label">累计输出 Token</div>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-title">服务信息</div>
       <div style="display:grid;grid-template-columns:auto 1fr;gap:0.6rem 1.2rem;font-size:0.9rem;">
         <span style="color:var(--ink-faint)">Worker 地址</span>
         <span id="workerUrl" style="font-family:monospace;font-size:0.85rem;">-</span>
         <span style="color:var(--ink-faint)">调度策略</span>
-        <span>轮询（Round Robin）</span>
+        <span>智能轮询（LRU + 频率保护 + 失败退避）</span>
+        <span style="color:var(--ink-faint)">用量统计</span>
+        <span>双维度 · API Key + GLM Cookie · 按日聚合</span>
         <span style="color:var(--ink-faint)">管理接口</span>
         <span><span class="badge badge-online">受保护</span> 需 X-Admin-Key</span>
         <span style="color:var(--ink-faint)">协议兼容</span>
@@ -482,11 +500,15 @@ export function getAdminPanelHTML(): string {
           <thead>
             <tr>
               <th>API Key</th>
+              <th style="text-align:right">请求数</th>
+              <th style="text-align:right">输入 Token</th>
+              <th style="text-align:right">输出 Token</th>
+              <th>最后使用</th>
               <th style="text-align:right">操作</th>
             </tr>
           </thead>
           <tbody id="apiKeysTableBody">
-            <tr><td colspan="2" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>
+            <tr><td colspan="6" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>
           </tbody>
         </table>
       </div>
@@ -532,12 +554,97 @@ export function getAdminPanelHTML(): string {
               <th>ID</th>
               <th>Token 预览</th>
               <th>状态</th>
+              <th style="text-align:right">请求数</th>
+              <th style="text-align:right">输入 Token</th>
+              <th style="text-align:right">输出 Token</th>
+              <th>最后使用</th>
               <th style="text-align:right">操作</th>
             </tr>
           </thead>
           <tbody id="tokensTableBody">
-            <tr><td colspan="4" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>
+            <tr><td colspan="8" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>
           </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Usage Stats Section -->
+  <div class="section" id="section-usage">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem;flex-wrap:wrap;gap:0.6rem;">
+        <div class="card-title" style="margin:0;border:none;padding:0;">按 API Key 维度</div>
+        <div style="display:flex;gap:0.4rem;">
+          <button class="btn btn-secondary btn-sm" onclick="loadUsageApiKeys()">刷新</button>
+          <button class="btn btn-danger btn-sm" onclick="resetAllStats()">重置全部</button>
+        </div>
+      </div>
+      <p style="color:var(--ink-faint);font-size:0.82rem;margin-bottom:0.8rem;">点击某行查看按日期的明细。Token 数为字符估算（GLM 网页 API 不返回真实用量）。</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>API Key</th>
+              <th style="text-align:right">请求</th>
+              <th style="text-align:right">成功</th>
+              <th style="text-align:right">失败</th>
+              <th style="text-align:right">输入 Token</th>
+              <th style="text-align:right">输出 Token</th>
+              <th>最后使用</th>
+            </tr>
+          </thead>
+          <tbody id="usageApiKeyTableBody">
+            <tr><td colspan="7" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem;">
+        <div class="card-title" style="margin:0;border:none;padding:0;">按 GLM Cookie (Token) 维度</div>
+        <button class="btn btn-secondary btn-sm" onclick="loadUsageTokens()">刷新</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Token ID</th>
+              <th>Cookie 预览</th>
+              <th>状态</th>
+              <th style="text-align:right">请求</th>
+              <th style="text-align:right">成功</th>
+              <th style="text-align:right">失败</th>
+              <th style="text-align:right">输入 Token</th>
+              <th style="text-align:right">输出 Token</th>
+              <th>最后使用</th>
+            </tr>
+          </thead>
+          <tbody id="usageTokenTableBody">
+            <tr><td colspan="9" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" id="usageDailyCard" style="display:none;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem;">
+        <div class="card-title" style="margin:0;border:none;padding:0;" id="usageDailyTitle">明细</div>
+        <button class="btn btn-secondary btn-sm" onclick="closeUsageDaily()">关闭</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th style="text-align:right">请求</th>
+              <th style="text-align:right">成功</th>
+              <th style="text-align:right">失败</th>
+              <th style="text-align:right">输入 Token</th>
+              <th style="text-align:right">输出 Token</th>
+            </tr>
+          </thead>
+          <tbody id="usageDailyTableBody"></tbody>
         </table>
       </div>
     </div>
@@ -688,6 +795,7 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
     if (name === 'apikeys') loadApiKeys();
     if (name === 'tokens') loadTokens();
     if (name === 'dashboard') loadDashboard();
+    if (name === 'usage') loadUsage();
   };
   
   window.doLogin = async function() {
@@ -722,30 +830,64 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
     } catch (e) {
       $('statStatus').innerHTML = '<span class="badge badge-offline">异常</span>';
     }
+
+    // 累计用量（用 token 维度汇总，与 server 的 getSummary 一致）
+    try {
+      const stData = await api('/admin/stats', { method: 'GET' });
+      const sum = stData.summary || {};
+      $('statTotalRequests').textContent = formatNum(sum.total_requests || 0);
+      $('statTotalInputTokens').textContent = formatNum(sum.total_input_tokens || 0);
+      $('statTotalOutputTokens').textContent = formatNum(sum.total_output_tokens || 0);
+    } catch (e) {
+      $('statTotalRequests').textContent = '-';
+      $('statTotalInputTokens').textContent = '-';
+      $('statTotalOutputTokens').textContent = '-';
+    }
   };
+
+  function formatNum(n) {
+    if (n == null || isNaN(n)) return '0';
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return String(n);
+  }
+
+  function formatTime(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return '—';
+    const pad = function(n) { return String(n).padStart(2, '0'); };
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
   
   // ==================== API Key Management ====================
   
   window.loadApiKeys = async function() {
     const tbody = $('apiKeysTableBody');
-    tbody.innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>';
     try {
       const data = await api('/admin/apikey', { method: 'GET' });
       const keys = data.keys || [];
       if (keys.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--ink-faint)">暂无配置 API Key</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--ink-faint)">暂无配置 API Key</td></tr>';
         return;
       }
       tbody.innerHTML = keys.map(function(k) {
         return '<tr data-key="' + k.api_key + '">' +
           '<td><span class="key-mask">' + maskKey(k.api_key) + '</span></td>' +
+          '<td style="text-align:right">' + formatNum(k.total_requests || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(k.total_input_tokens || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(k.total_output_tokens || 0) + '</td>' +
+          '<td style="color:var(--ink-faint);font-size:0.82rem;">' + formatTime(k.last_used) + '</td>' +
           '<td style="text-align:right">' +
             '<button class="btn btn-danger btn-sm" onclick="deleteApiKey(\\'' + k.api_key + '\\')">删除</button>' +
           '</td>' +
         '</tr>';
       }).join('');
     } catch (e) {
-      tbody.innerHTML = '<tr><td colspan="2" style="text-align:center;color:var(--crimson)">加载失败: ' + e.message + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--crimson)">加载失败: ' + e.message + '</td></tr>';
     }
   };
   
@@ -786,12 +928,12 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
   
   window.loadTokens = async function() {
     const tbody = $('tokensTableBody');
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>';
     try {
       const data = await api('/admin/token', { method: 'GET' });
       const tokens = data.tokens || [];
       if (tokens.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--ink-faint)">Token 池为空</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--ink-faint)">Token 池为空</td></tr>';
         return;
       }
       tbody.innerHTML = tokens.map(function(t) {
@@ -799,6 +941,10 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
           '<td><code style="font-size:0.8rem;background:var(--parchment-dark);padding:2px 6px;border-radius:3px;">' + t.id + '</code></td>' +
           '<td><span class="key-mask">' + t.token_preview + '</span></td>' +
           '<td><span class="badge badge-unknown token-status-badge">未检测</span></td>' +
+          '<td style="text-align:right">' + formatNum(t.total_requests || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(t.total_input_tokens || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(t.total_output_tokens || 0) + '</td>' +
+          '<td style="color:var(--ink-faint);font-size:0.82rem;">' + formatTime(t.last_used) + '</td>' +
           '<td style="text-align:right">' +
             '<button class="btn btn-secondary btn-sm" onclick="checkToken(\\'' + t.id + '\\', this)">检测</button>' +
             '<button class="btn btn-danger btn-sm" onclick="deleteToken(\\'' + t.id + '\\')">删除</button>' +
@@ -806,7 +952,7 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
         '</tr>';
       }).join('');
     } catch (e) {
-      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--crimson)">加载失败: ' + e.message + '</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--crimson)">加载失败: ' + e.message + '</td></tr>';
     }
   };
 
@@ -892,6 +1038,142 @@ curl -X DELETE <span class="string">"<span class="guideAdminUrl">https://your-do
   function maskKey(key) {
     if (key.length <= 8) return key;
     return key.slice(0, 6) + '****' + key.slice(-4);
+  }
+
+  // ==================== Usage Stats ====================
+
+  window.loadUsage = function() {
+    loadUsageApiKeys();
+    loadUsageTokens();
+    closeUsageDaily();
+  };
+
+  window.loadUsageApiKeys = async function() {
+    const tbody = $('usageApiKeyTableBody');
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>';
+    try {
+      const data = await api('/admin/stats/apikeys', { method: 'GET' });
+      const list = data.apikeys || [];
+      if (list.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--ink-faint)">暂无统计数据</td></tr>';
+        return;
+      }
+      // 按请求数降序
+      list.sort(function(a, b) { return (b.total?.requests || 0) - (a.total?.requests || 0); });
+      tbody.innerHTML = list.map(function(item) {
+        const t = item.total || {};
+        const mark = item.configured ? '' : ' <span class="badge badge-unknown" title="未在配置列表">历史</span>';
+        return '<tr style="cursor:pointer" onclick="showApiKeyDaily(\\'' + escapeJs(item.api_key) + '\\')">' +
+          '<td><span class="key-mask">' + maskKey(item.api_key) + '</span>' + mark + '</td>' +
+          '<td style="text-align:right">' + formatNum(t.requests || 0) + '</td>' +
+          '<td style="text-align:right;color:var(--green)">' + formatNum(t.success || 0) + '</td>' +
+          '<td style="text-align:right;color:var(--crimson)">' + formatNum(t.fail || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(t.input_tokens || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(t.output_tokens || 0) + '</td>' +
+          '<td style="color:var(--ink-faint);font-size:0.82rem;">' + formatTime(item.last_used) + '</td>' +
+        '</tr>';
+      }).join('');
+    } catch (e) {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--crimson)">加载失败: ' + e.message + '</td></tr>';
+    }
+  };
+
+  window.loadUsageTokens = async function() {
+    const tbody = $('usageTokenTableBody');
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--ink-faint)">加载中...</td></tr>';
+    try {
+      const data = await api('/admin/stats/tokens', { method: 'GET' });
+      const list = data.tokens || [];
+      if (list.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--ink-faint)">暂无统计数据</td></tr>';
+        return;
+      }
+      list.sort(function(a, b) { return (b.total?.requests || 0) - (a.total?.requests || 0); });
+      tbody.innerHTML = list.map(function(item) {
+        const t = item.total || {};
+        const status = item.in_pool
+          ? '<span class="badge badge-online">在池</span>'
+          : '<span class="badge badge-unknown">已移除</span>';
+        return '<tr style="cursor:pointer" onclick="showTokenDaily(\\'' + escapeJs(item.id) + '\\')">' +
+          '<td><code style="font-size:0.78rem;background:var(--parchment-dark);padding:2px 6px;border-radius:3px;">' + item.id + '</code></td>' +
+          '<td><span class="key-mask">' + (item.token_preview || '—') + '</span></td>' +
+          '<td>' + status + '</td>' +
+          '<td style="text-align:right">' + formatNum(t.requests || 0) + '</td>' +
+          '<td style="text-align:right;color:var(--green)">' + formatNum(t.success || 0) + '</td>' +
+          '<td style="text-align:right;color:var(--crimson)">' + formatNum(t.fail || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(t.input_tokens || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(t.output_tokens || 0) + '</td>' +
+          '<td style="color:var(--ink-faint);font-size:0.82rem;">' + formatTime(item.last_used) + '</td>' +
+        '</tr>';
+      }).join('');
+    } catch (e) {
+      tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--crimson)">加载失败: ' + e.message + '</td></tr>';
+    }
+  };
+
+  window.showApiKeyDaily = async function(apiKey) {
+    try {
+      const data = await api('/admin/stats/apikeys?key=' + encodeURIComponent(apiKey), { method: 'GET' });
+      renderDaily('API Key · ' + maskKey(apiKey), data.daily || {});
+    } catch (e) {
+      showToast('加载明细失败: ' + e.message, 'error');
+    }
+  };
+
+  window.showTokenDaily = async function(id) {
+    try {
+      const data = await api('/admin/stats/tokens?id=' + encodeURIComponent(id), { method: 'GET' });
+      const title = 'GLM Token · ' + id + (data.token_preview ? ' (' + data.token_preview + ')' : '');
+      renderDaily(title, data.daily || {});
+    } catch (e) {
+      showToast('加载明细失败: ' + e.message, 'error');
+    }
+  };
+
+  function renderDaily(title, daily) {
+    const card = $('usageDailyCard');
+    const tbody = $('usageDailyTableBody');
+    $('usageDailyTitle').textContent = '每日明细 · ' + title;
+    const dates = Object.keys(daily).sort(function(a, b) { return b.localeCompare(a); });
+    if (dates.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--ink-faint)">无明细数据</td></tr>';
+    } else {
+      tbody.innerHTML = dates.map(function(date) {
+        const d = daily[date] || {};
+        return '<tr>' +
+          '<td style="font-family:monospace;">' + date + '</td>' +
+          '<td style="text-align:right">' + formatNum(d.requests || 0) + '</td>' +
+          '<td style="text-align:right;color:var(--green)">' + formatNum(d.success || 0) + '</td>' +
+          '<td style="text-align:right;color:var(--crimson)">' + formatNum(d.fail || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(d.input_tokens || 0) + '</td>' +
+          '<td style="text-align:right">' + formatNum(d.output_tokens || 0) + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+    card.style.display = 'block';
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  window.closeUsageDaily = function() {
+    $('usageDailyCard').style.display = 'none';
+  };
+
+  window.resetAllStats = async function() {
+    if (!confirm('确定要重置所有用量统计数据吗？该操作不可恢复。')) return;
+    try {
+      await api('/admin/stats/reset', { method: 'POST' });
+      showToast('统计数据已重置', 'success');
+      loadUsage();
+      loadDashboard();
+      loadApiKeys();
+      loadTokens();
+    } catch (e) {
+      showToast('重置失败: ' + e.message, 'error');
+    }
+  };
+
+  function escapeJs(s) {
+    return String(s).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
   }
 
   function init() {
