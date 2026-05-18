@@ -5,6 +5,7 @@ import {
   randomChoice, sleep, fetchFileBASE64
 } from "./utils.ts";
 import { createParser } from "./sse.ts";
+import { getSsxmodCookieString, refreshSsxmodCookies } from "./ssxmod.ts";
 
 const MODEL_NAME = "glm";
 const DEFAULT_ASSISTANT_ID = "65940acff94777010aa6b796";
@@ -19,15 +20,60 @@ export function setSignSecret(secret: string) {
   signSecret = secret;
 }
 
-const USER_AGENTS = [
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
+// ============================================================
+// 浏览器画像池：UA / Sec-Ch-Ua / Platform 必须保持一致
+// 否则上游风控很容易识别为伪造（旧版 UA 随机但 Platform 写死 Windows）
+// ============================================================
+interface BrowserProfile {
+  userAgent: string;
+  secChUa: string;
+  secChUaPlatform: string;
+  secChUaMobile: string;
+}
+
+const BROWSER_PROFILES: BrowserProfile[] = [
+  // Chrome 130 on Windows
+  {
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    secChUa: '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+    secChUaPlatform: '"Windows"',
+    secChUaMobile: "?0",
+  },
+  // Chrome 131 on macOS
+  {
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    secChUa: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    secChUaPlatform: '"macOS"',
+    secChUaMobile: "?0",
+  },
+  // Edge 130 on Windows
+  {
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    secChUa: '"Microsoft Edge";v="130", "Chromium";v="130", "Not?A_Brand";v="99"',
+    secChUaPlatform: '"Windows"',
+    secChUaMobile: "?0",
+  },
+  // Chrome 131 on Linux
+  {
+    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    secChUa: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    secChUaPlatform: '"Linux"',
+    secChUaMobile: "?0",
+  },
+  // Firefox 132 on Windows（无 sec-ch-ua，正确做法是不设置）
+  {
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
+    secChUa: "",
+    secChUaPlatform: "",
+    secChUaMobile: "",
+  },
 ];
 
-const FAKE_HEADERS: Record<string, string> = {
+function pickBrowserProfile(): BrowserProfile {
+  return randomChoice(BROWSER_PROFILES) || BROWSER_PROFILES[0];
+}
+
+const BASE_HEADERS: Record<string, string> = {
   "Accept": "text/event-stream",
   "Accept-Encoding": "gzip, deflate, br, zstd",
   "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
@@ -37,9 +83,6 @@ const FAKE_HEADERS: Record<string, string> = {
   "Origin": "https://chatglm.cn",
   "Pragma": "no-cache",
   "Priority": "u=1, i",
-  "Sec-Ch-Ua": '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
-  "Sec-Ch-Ua-Mobile": "?0",
-  "Sec-Ch-Ua-Platform": '"Windows"',
   "Sec-Fetch-Dest": "empty",
   "Sec-Fetch-Mode": "cors",
   "Sec-Fetch-Site": "same-origin",
@@ -52,9 +95,35 @@ const FAKE_HEADERS: Record<string, string> = {
   "X-Lang": "zh"
 };
 
-function getHeaders() {
-  const userAgent = randomChoice(USER_AGENTS) || USER_AGENTS[0];
-  return { ...FAKE_HEADERS, "User-Agent": userAgent };
+/**
+ * 构造一份完整请求头：
+ *   1. 选一组 UA / sec-ch-ua / platform 三件套，避免不一致被识别
+ *   2. 注入 ssxmod_itna / ssxmod_itna2 风控 Cookie（缓存 15 分钟）
+ *   3. 调用方传入的 Cookie/sec-ch-ua 等会覆盖默认值
+ */
+function getHeaders(extraCookie?: string): Record<string, string> {
+  const profile = pickBrowserProfile();
+  const headers: Record<string, string> = {
+    ...BASE_HEADERS,
+    "User-Agent": profile.userAgent,
+  };
+  if (profile.secChUa) headers["Sec-Ch-Ua"] = profile.secChUa;
+  if (profile.secChUaMobile) headers["Sec-Ch-Ua-Mobile"] = profile.secChUaMobile;
+  if (profile.secChUaPlatform) headers["Sec-Ch-Ua-Platform"] = profile.secChUaPlatform;
+
+  // 注入风控 Cookie（chatglm.cn 实际用通联达 ssxmod 系统）
+  let cookie = "";
+  try {
+    cookie = getSsxmodCookieString();
+  } catch (e) {
+    console.error("[ssxmod] 生成 Cookie 失败，跳过注入:", (e as Error).message);
+  }
+  if (extraCookie) {
+    cookie = cookie ? `${cookie}; ${extraCookie}` : extraCookie;
+  }
+  if (cookie) headers["Cookie"] = cookie;
+
+  return headers;
 }
 
 // ==================== Tool Calling Helpers ====================
@@ -325,6 +394,10 @@ export class TokenExpiredError extends Error {
 }
 
 async function checkResult(response: Response, refreshToken: string): Promise<any> {
+  // 403 / 风控页通常返回 HTML 而非 JSON：换一组 ssxmod cookie 让下次重试有机会绕过
+  if (response.status === 403 || response.status === 429) {
+    try { refreshSsxmodCookies(); } catch {}
+  }
   const data: any = await response.json().catch(() => null);
   if (!data) return null;
   const { code, status, message } = data;
@@ -403,6 +476,8 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
       if (errText.includes("40102") || errText.includes("refresh_token")) {
         throw new TokenExpiredError("refresh_token已过期");
       }
+      // 非 SSE 响应通常是 HTML 风控页：换一组 ssxmod cookie 给下次重试一次机会
+      try { refreshSsxmodCookies(); } catch {}
       throw new Error(`上游返回非SSE响应: ${contentType} ${errText.slice(0, 200)}`);
     }
     const answer = await receiveStream(model, response.body!, tools);
@@ -472,6 +547,8 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
       if (errText.includes("40102") || errText.includes("refresh_token")) {
         throw new TokenExpiredError("refresh_token已过期");
       }
+      // 非 SSE 响应通常是 HTML 风控页：换一组 ssxmod cookie 给下次重试一次机会
+      try { refreshSsxmodCookies(); } catch {}
       throw new Error(`上游返回非SSE响应: ${contentType} ${errText.slice(0, 200)}`);
     }
     return createTransStream(model, response.body!, (convId: string) => {
@@ -517,7 +594,10 @@ export async function generateImages(model = "65a232c082ff90a2ad2f15e2", prompt:
       }
     );
     const contentType = response.headers.get("content-type") || "";
-    if (!contentType.includes("text/event-stream")) throw new Error(`Stream response Content-Type invalid: ${contentType}`);
+    if (!contentType.includes("text/event-stream")) {
+      try { refreshSsxmodCookies(); } catch {}
+      throw new Error(`Stream response Content-Type invalid: ${contentType}`);
+    }
     const { convId, imageUrls } = await receiveImages(response.body!);
     removeConversation(convId, refreshToken, model).catch(() => {});
     if (imageUrls.length == 0) throw new Error("图像生成失败");
