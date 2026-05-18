@@ -18,6 +18,7 @@ import {
 } from "./utils.ts";
 import { WELCOME_HTML } from "./welcome.ts";
 import { getAdminPanelHTML } from "./admin-panel.ts";
+import { sharedTokenRotator } from "./token-rotator.ts";
 
 export interface Env {
   SIGN_SECRET?: string;
@@ -82,6 +83,7 @@ let tokenRoundRobinIndex = 0;
 
 function selectTokenFromPool(tokens: { id: string; token: string }[]): { id: string; token: string } | null {
   if (tokens.length === 0) return null;
+  // 沿用：只有非智能路径（authenticate）会用这个简单 RR
   const idx = tokenRoundRobinIndex % tokens.length;
   tokenRoundRobinIndex++;
   return tokens[idx];
@@ -116,24 +118,42 @@ async function executeWithTokenRotation<T>(
   const pool = await getTokenPool(env.GLM_TOKENS);
   if (pool.length === 0) throw new Error("No refresh tokens available in pool");
 
+  // 同步 rotator 状态：清掉已不存在的 token 状态
+  sharedTokenRotator.syncPool(pool);
+
   let lastError: Error | null = null;
   const tried = new Set<string>();
 
+  // 最多尝试池中所有 token
   for (let i = 0; i < pool.length; i++) {
-    const selected = selectTokenFromPool(pool);
-    if (!selected || tried.has(selected.token)) continue;
-    tried.add(selected.token);
+    const selected = sharedTokenRotator.select(pool);
+    if (!selected) break;
+    if (tried.has(selected.id)) {
+      // 防止 select 在所有可用都被 tried 过后重复返回同一个：跳出
+      break;
+    }
+    tried.add(selected.id);
 
     try {
-      return await fn(selected.token);
+      sharedTokenRotator.markUsed(selected.id);
+      const result = await fn(selected.token);
+      sharedTokenRotator.markSuccess(selected.id);
+      return result;
     } catch (err: any) {
       lastError = err;
       if (err instanceof TokenExpiredError) {
+        // 真正过期：从 KV 中删除 + 清除 rotator 状态
         console.error(`[TokenPool] Token ${selected.id} 过期，移除并尝试下一个`);
         await removeExpiredToken(env.GLM_TOKENS, selected.token);
+        sharedTokenRotator.remove(selected.id);
         continue;
       }
-      throw err;
+      // 其他错误（网络/5xx/风控）：进冷却，不删 KV，给下一次请求一个换 token 的机会
+      const until = sharedTokenRotator.markFailure(selected.id);
+      console.error(
+        `[TokenPool] Token ${selected.id} 失败: ${err?.message || err}; 冷却到 ${new Date(until).toISOString()}`
+      );
+      continue;
     }
   }
 
@@ -409,6 +429,31 @@ async function handleAdminTokenCheck(request: Request, env: Env): Promise<Respon
   return jsonResponse({ id, live });
 }
 
+// 查看 Token 轮询器内部状态（最近使用、失败计数、冷却信息）
+async function handleAdminRotatorStatus(request: Request, env: Env): Promise<Response> {
+  const adminKey = request.headers.get("X-Admin-Key") || "";
+  if (env.ADMIN_KEY && adminKey !== env.ADMIN_KEY) {
+    return errorResponse("Unauthorized: invalid admin key", 401);
+  }
+  const pool = await getTokenPool(env.GLM_TOKENS);
+  sharedTokenRotator.syncPool(pool);
+  const snapshot = sharedTokenRotator.snapshot();
+  const now = Date.now();
+  const tokens = pool.map((t) => {
+    const s = snapshot[t.id] || { lastUsed: 0, failCount: 0, cooldownUntil: 0, recentTimestamps: [] };
+    return {
+      id: t.id,
+      lastUsed: s.lastUsed,
+      lastUsedAgoMs: s.lastUsed ? now - s.lastUsed : null,
+      failCount: s.failCount,
+      cooldownUntil: s.cooldownUntil,
+      cooldownRemainingMs: s.cooldownUntil > now ? s.cooldownUntil - now : 0,
+      recentRequests: s.recentTimestamps.length,
+    };
+  });
+  return jsonResponse({ now, total: tokens.length, tokens });
+}
+
 // ==================== Main Export ====================
 
 export default {
@@ -463,6 +508,8 @@ export default {
         response = await handleAdminToken(request, env);
       } else if (path === "/admin/token/check" && request.method === "POST") {
         response = await handleAdminTokenCheck(request, env);
+      } else if (path === "/admin/rotator" && request.method === "GET") {
+        response = await handleAdminRotatorStatus(request, env);
       } else {
         const message = `[请求有误]: 正确请求为 POST -> /v1/chat/completions，当前请求为 ${request.method} -> ${path} 请纠正`;
         response = errorResponse(message, 404);
