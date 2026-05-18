@@ -57,12 +57,16 @@ async function verifyAPIKey(kv: KVNamespace, apiKey: string): Promise<boolean> {
   return val !== null;
 }
 
-async function getTokenPool(kv: KVNamespace): Promise<{ id: string; token: string }[]> {
+async function getTokenPool(kv: KVNamespace): Promise<{ id: string; token: string; disabled?: boolean }[]> {
   const list = await kv.list({ prefix: "rt:" });
-  const tokens: { id: string; token: string }[] = [];
+  const tokens: { id: string; token: string; disabled?: boolean }[] = [];
   for (const key of list.keys) {
     const token = await kv.get(key.name);
-    if (token) tokens.push({ id: key.name.replace("rt:", ""), token });
+    if (!token) continue;
+    const id = key.name.replace("rt:", "");
+    // 是否被禁用：存在 rtd:<id> 标记即视为禁用
+    const disabled = (await kv.get(`rtd:${id}`)) !== null;
+    tokens.push({ id, token, disabled });
   }
   return tokens;
 }
@@ -398,7 +402,7 @@ async function handleAdminToken(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "GET") {
     const pool = await getTokenPool(env.GLM_TOKENS);
-    return jsonResponse({ tokens: pool.map((t) => ({ id: t.id, token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4) })) });
+    return jsonResponse({ tokens: pool.map((t) => ({ id: t.id, disabled: !!t.disabled, token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4) })) });
   }
 
   if (request.method === "DELETE") {
@@ -406,6 +410,8 @@ async function handleAdminToken(request: Request, env: Env): Promise<Response> {
     const id = body.id;
     if (!id) return errorResponse("Missing id", 400);
     await env.GLM_TOKENS.delete(`rt:${id}`);
+    await env.GLM_TOKENS.delete(`rtd:${id}`);
+    sharedTokenRotator.remove(id);
     return jsonResponse({ success: true, message: "Token removed from pool" });
   }
 
@@ -443,6 +449,7 @@ async function handleAdminRotatorStatus(request: Request, env: Env): Promise<Res
     const s = snapshot[t.id] || { lastUsed: 0, failCount: 0, cooldownUntil: 0, recentTimestamps: [] };
     return {
       id: t.id,
+      disabled: !!t.disabled,
       lastUsed: s.lastUsed,
       lastUsedAgoMs: s.lastUsed ? now - s.lastUsed : null,
       failCount: s.failCount,
@@ -452,6 +459,34 @@ async function handleAdminRotatorStatus(request: Request, env: Env): Promise<Res
     };
   });
   return jsonResponse({ now, total: tokens.length, tokens });
+}
+
+// 启用/禁用某 token：保留凭证但停止参与轮询；可选同时清除冷却状态
+async function handleAdminToggleToken(request: Request, env: Env): Promise<Response> {
+  const adminKey = request.headers.get("X-Admin-Key") || "";
+  if (env.ADMIN_KEY && adminKey !== env.ADMIN_KEY) {
+    return errorResponse("Unauthorized: invalid admin key", 401);
+  }
+  const body = (await request.json()) as any;
+  const id = body.id;
+  if (!id) return errorResponse("Missing id", 400);
+
+  const refreshToken = await env.GLM_TOKENS.get(`rt:${id}`);
+  if (!refreshToken) return errorResponse("Token not found", 404);
+
+  if (typeof body.disabled === "boolean") {
+    if (body.disabled) {
+      await env.GLM_TOKENS.put(`rtd:${id}`, "1");
+    } else {
+      await env.GLM_TOKENS.delete(`rtd:${id}`);
+    }
+  }
+  if (body.reset === true) {
+    // 清空 rotator 内存中的失败计数和冷却（仅当前 isolate）
+    sharedTokenRotator.markSuccess(id);
+  }
+  const disabled = (await env.GLM_TOKENS.get(`rtd:${id}`)) !== null;
+  return jsonResponse({ success: true, id, disabled });
 }
 
 // ==================== Main Export ====================
@@ -508,6 +543,8 @@ export default {
         response = await handleAdminToken(request, env);
       } else if (path === "/admin/token/check" && request.method === "POST") {
         response = await handleAdminTokenCheck(request, env);
+      } else if (path === "/admin/token/toggle" && request.method === "POST") {
+        response = await handleAdminToggleToken(request, env);
       } else if (path === "/admin/rotator" && request.method === "GET") {
         response = await handleAdminRotatorStatus(request, env);
       } else {

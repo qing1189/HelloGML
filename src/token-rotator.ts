@@ -15,6 +15,8 @@
 export interface RotatableToken {
   id: string;
   token: string;
+  /** 管理员手动禁用：保留凭证但永不参与轮询 */
+  disabled?: boolean;
 }
 
 interface TokenRuntimeState {
@@ -62,19 +64,23 @@ export class TokenRotator {
 
   /**
    * 从池中选出最适合的 token；返回 null 表示当前所有 token 都不可用。
-   * 优先级：可用（无冷却 + 未超频率） > 最久未用 > 故障最少。
+   * 优先级：可用（未禁用 + 无冷却 + 未超频率） > 最久未用 > 故障最少。
    */
   select(tokens: RotatableToken[]): RotatableToken | null {
     if (tokens.length === 0) return null;
 
     const now = Date.now();
-    const available = tokens.filter((t) => this.isAvailable(t.id, now));
+    // disabled 的 token 永远不参与轮询（包括 fallback 兜底）
+    const candidates = tokens.filter((t) => !t.disabled);
+    if (candidates.length === 0) return null;
+
+    const available = candidates.filter((t) => this.isAvailable(t.id, now));
 
     // 全部不可用：尝试简单轮询作为最后兜底（可能成功也可能再次失败，但不卡住）
     if (available.length === 0) {
-      const idx = this.rrIndex % tokens.length;
+      const idx = this.rrIndex % candidates.length;
       this.rrIndex++;
-      return tokens[idx];
+      return candidates[idx];
     }
 
     // LRU：选 lastUsed 最小的（从未用过 lastUsed=0，优先选）

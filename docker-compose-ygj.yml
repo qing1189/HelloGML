@@ -8,15 +8,25 @@ services:
     environment:
       - ADMIN_KEY=changeme
       - DATA_DIR=/app/data
+      # ===== 智能轮询参数（不设则使用代码内默认值）=====
+      # - TOKEN_MIN_INTERVAL=3000      # 同一 token 最小使用间隔（毫秒）
+      # - TOKEN_RATE_LIMIT=20          # 每个 token 每分钟最大请求数
+      # - GLOBAL_QPS=10                # 全局每秒最大并发请求数
+      # ===== 反爬 ssxmod 风控 Cookie 配置 =====
+      # - SSXMOD_TTL_MS=900000         # Cookie 缓存有效期（毫秒），默认 15 分钟
+      # - SSXMOD_PLATFORM=macIntel     # 浏览器画像 macIntel / macM1 / win64 / linux
+      # - SSXMOD_SCREEN=1470x956       # 屏幕预设 1920x1080 / 2560x1440 / 1470x956 / 1440x900 / 1536x864
+      # - SSXMOD_LOCALE=zh-CN          # 语言时区 zh-CN / zh-TW / en-US / ja-JP / ko-KR
+      # - SSXMOD_STABLE_DEVICE_ID=true # 进程内 deviceId 是否稳定（默认 true）
     volumes:
       # 目录挂载：避免单文件绑定挂载在宿主机上文件不存在时被 Docker 创建成目录
       # 镜像内 entrypoint 会在启动时自动 chown 该目录并降权到 node 用户运行
       - ./data:/app/data
-    # 资源限制：限制最大 128MB 内存，避免偶发泄漏影响宿主机
+    # 资源限制：限制最大 160MB 内存（指纹/ssxmod 模块约 +20MB）
     deploy:
       resources:
         limits:
-          memory: 128M
+          memory: 160M
     # 健康检查：自动探活
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:38412/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]

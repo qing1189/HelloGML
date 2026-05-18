@@ -54,6 +54,6 @@ ENV NODE_ENV=production \
 
 EXPOSE 38412
 
-# --max-old-space-size=96 把 V8 堆上限控制在 96MB，整体 RSS 约 55-70MB
+# --max-old-space-size=128 把 V8 堆上限控制在 128MB，整体 RSS 约 70-90MB（含指纹/ssxmod 模块）
 ENTRYPOINT ["dumb-init", "--", "/usr/local/bin/docker-entrypoint.sh"]
-CMD ["node", "--max-old-space-size=96", "/app/server.mjs"]
+CMD ["node", "--max-old-space-size=128", "/app/server.mjs"]

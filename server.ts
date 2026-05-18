@@ -37,6 +37,7 @@ import {
   getTokenLiveStatus,
   TokenExpiredError,
 } from "./src/chat.ts";
+import { configureSsxmod } from "./src/ssxmod.ts";
 import {
   createClaudeCompletion,
   createGeminiCompletion,
@@ -81,6 +82,19 @@ for (const f of [TOKEN_FILE, APIKEY_FILE]) {
 
 setSignSecret(SIGN_SECRET);
 
+// ==================== 反爬：ssxmod 风控 Cookie 配置 ====================
+// 让运维可以通过环境变量调节风控 Cookie 的刷新频率与浏览器画像。
+// 不传则使用默认（15 分钟刷新 + macIntel/zh-CN 画像，进程内 deviceId 稳定）。
+configureSsxmod({
+  ttlMs: parseInt(process.env.SSXMOD_TTL_MS || "0") || undefined,
+  fingerprint: {
+    platform: (process.env.SSXMOD_PLATFORM as any) || undefined,
+    screen: (process.env.SSXMOD_SCREEN as any) || undefined,
+    locale: (process.env.SSXMOD_LOCALE as any) || undefined,
+  },
+  stableDeviceId: process.env.SSXMOD_STABLE_DEVICE_ID !== "false",
+});
+
 // ==================== Token 本地存储 & 智能轮询 ====================
 
 // --- 轮询配置（可通过环境变量覆盖） ---
@@ -97,6 +111,7 @@ interface TokenEntry {
   addedAt: number;
   lastUsed: number;
   failCount: number;
+  disabled?: boolean;       // 持久化：管理员手动禁用（保留凭证但不参与轮询）
   // 以下字段仅运行时使用，不持久化
   requestTimestamps?: number[];  // 最近 1 分钟内的请求时间戳
   cooldownUntil?: number;  // 冷却到期时间
@@ -122,9 +137,9 @@ function loadTokens() {
 }
 
 function saveTokens() {
-  // 持久化时排除运行时字段
-  const data = tokenPool.map(({ id, token, addedAt, lastUsed, failCount }) => ({
-    id, token, addedAt, lastUsed, failCount
+  // 持久化时排除运行时字段（disabled 需要保留）
+  const data = tokenPool.map(({ id, token, addedAt, lastUsed, failCount, disabled }) => ({
+    id, token, addedAt, lastUsed, failCount, disabled: !!disabled
   }));
   fs.writeFileSync(TOKEN_FILE, JSON.stringify(data, null, 2));
 }
@@ -164,8 +179,20 @@ function saveApiKeys() {
 // --- 智能选择：LRU（最久未用优先）+ 间隔保护 + 频率窗口 + 冷却退避 ---
 
 function isTokenAvailable(entry: TokenEntry, now: number): boolean {
+  // 0. 管理员人为禁用：保留凭证但永不参与轮询（参考 Qwen-Proxy-qing 的 disabled 字段）
+  if (entry.disabled) return false;
+
   // 1. 失败次数超限
-  if (entry.failCount >= TOKEN_MAX_FAIL_COUNT) return false;
+  if (entry.failCount >= TOKEN_MAX_FAIL_COUNT) {
+    // 自动恢复：失败次数到上限后，如果距离上次使用超过冷却期，重置失败计数
+    // （对应 Qwen-Proxy-qing account-rotator 的 cooldown 自愈逻辑）
+    if (entry.lastUsed && now - entry.lastUsed > TOKEN_COOLDOWN_BASE_MS * Math.pow(2, TOKEN_MAX_FAIL_COUNT)) {
+      entry.failCount = 0;
+      entry.cooldownUntil = 0;
+    } else {
+      return false;
+    }
+  }
 
   // 2. 正在冷却中（失败后指数退避）
   if (entry.cooldownUntil && now < entry.cooldownUntil) return false;
@@ -650,6 +677,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             return {
               id: t.id,
               token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4),
+              disabled: !!t.disabled,
               failCount: t.failCount,
               last_used: t.lastUsed || 0,
               total_requests: s?.total.requests || 0,
@@ -677,6 +705,66 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       if (!entry) { errorResponse(res, "Token not found", 404); return; }
       const live = await getTokenLiveStatus(entry.token);
       jsonResponse(res, { id: body.id, live });
+      return;
+    }
+
+    // 启用/禁用 token（保留凭证但停止参与轮询；解除冷却时也清空 failCount）
+    // POST /admin/token/toggle  body: { id, disabled?: bool, reset?: bool }
+    if (p === "/admin/token/toggle" && req.method === "POST") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      const body = await readBody(req);
+      if (!body.id) { errorResponse(res, "Missing id"); return; }
+      const entry = tokenPool.find((t) => t.id === body.id);
+      if (!entry) { errorResponse(res, "Token not found", 404); return; }
+      if (typeof body.disabled === "boolean") entry.disabled = body.disabled;
+      if (body.reset === true) {
+        entry.failCount = 0;
+        entry.cooldownUntil = 0;
+      }
+      saveTokens();
+      jsonResponse(res, {
+        success: true,
+        id: entry.id,
+        disabled: !!entry.disabled,
+        failCount: entry.failCount,
+        cooldownUntil: entry.cooldownUntil || 0,
+      });
+      return;
+    }
+
+    // 查看 token 池实时运行状态（轮询器内部）
+    // GET /admin/rotator
+    if (p === "/admin/rotator" && req.method === "GET") {
+      if (!checkAdmin(req)) { errorResponse(res, "Unauthorized", 401); return; }
+      const now = Date.now();
+      const list = tokenPool.map((t) => {
+        const recent = (t.requestTimestamps || []).filter(ts => ts > now - TOKEN_RATE_LIMIT_WINDOW);
+        return {
+          id: t.id,
+          token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4),
+          disabled: !!t.disabled,
+          available: isTokenAvailable(t, now),
+          failCount: t.failCount,
+          lastUsed: t.lastUsed || 0,
+          lastUsedAgoMs: t.lastUsed ? now - t.lastUsed : null,
+          cooldownUntil: t.cooldownUntil || 0,
+          cooldownRemainingMs: (t.cooldownUntil || 0) > now ? (t.cooldownUntil! - now) : 0,
+          recentRequests: recent.length,
+        };
+      });
+      jsonResponse(res, {
+        now,
+        total: list.length,
+        available: list.filter(x => x.available).length,
+        config: {
+          minIntervalMs: TOKEN_MIN_INTERVAL_MS,
+          rateLimitPerMinute: TOKEN_RATE_LIMIT_MAX,
+          cooldownBaseMs: TOKEN_COOLDOWN_BASE_MS,
+          maxFailCount: TOKEN_MAX_FAIL_COUNT,
+          globalQpsLimit: GLOBAL_QPS_LIMIT,
+        },
+        tokens: list,
+      });
       return;
     }
 
